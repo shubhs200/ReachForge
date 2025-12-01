@@ -1,0 +1,3 @@
+# Minimal Python dependencies for reachforge4 CI bundle
+# Used by reachforge4/llm_adapters/openai.py for HTTP calls to the LLM provider
+requests>=2.31.0,<3

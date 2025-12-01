@@ -1,0 +1,14 @@
+{
+  "default": {
+    "model": "gpt-4.1",
+    "api_base": "https://api.openai.com/v1"
+  },
+  "driver": {
+    "model": "gpt-4.1",
+    "api_base": "https://api.openai.com/v1"
+  },
+  "seeds": {
+    "model": "gpt-4.1",
+    "api_base": "https://api.openai.com/v1"
+  }
+}
