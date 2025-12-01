@@ -1,0 +1,37 @@
+# ReachForge CI image (mirrors older FuzzHarnessGenerator approach)
+# Provides: Python, AFL++, toolchain, and runs the CI wrapper by default.
+
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Base tools and AFL++
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        git curl ca-certificates \
+        build-essential clang llvm lld make cmake \
+        afl++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/reachforge
+
+# Python deps for the internal LLM adapter
+COPY requirements.txt /opt/reachforge/requirements.txt
+RUN pip3 install --no-cache-dir -r /opt/reachforge/requirements.txt
+
+# Copy the rest of the repo
+COPY . /opt/reachforge
+
+# Ensure scripts are executable
+RUN chmod +x /opt/reachforge/scripts/ci-validate.sh || true && \
+    chmod +x /opt/reachforge/scripts/ci-run.sh || true
+
+# Environment expected by scripts/ci-run.sh
+ENV TARGET_ROOT=analyze-image \
+    FUZZ_HOURS=5 \
+    PYTHONPATH=/opt/reachforge
+
+# Default entrypoint runs the CI wrapper (TARGET_ROOT and FUZZ_HOURS can be overridden)
+ENTRYPOINT ["bash", "/opt/reachforge/scripts/ci-run.sh"]
+CMD ["analyze-image", "5"]

@@ -5,13 +5,23 @@ import json
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .prompt_main2fuzz import build_main2fuzz_prompt
-from .llm_runner import run_llm_driver_spec, run_llm_seeds_spec
-from .schema import validate_driver_spec, write_schema_file
-from .generator import write_driver_from_spec
-from .compiler import compile_driver
-from .prompt_seeds import build_seeds_prompt
-from .seeds_schema import validate_seeds_spec
+# Support both package execution (python -m reachforge.cli) and script execution (python cli.py)
+try:
+    from .prompt_main2fuzz import build_main2fuzz_prompt
+    from .llm_runner import run_llm_driver_spec, run_llm_seeds_spec
+    from .schema import validate_driver_spec, write_schema_file
+    from .generator import write_driver_from_spec
+    from .compiler import compile_driver
+    from .prompt_seeds import build_seeds_prompt
+    from .seeds_schema import validate_seeds_spec
+except ImportError:
+    from prompt_main2fuzz import build_main2fuzz_prompt
+    from llm_runner import run_llm_driver_spec, run_llm_seeds_spec
+    from schema import validate_driver_spec, write_schema_file
+    from generator import write_driver_from_spec
+    from compiler import compile_driver
+    from prompt_seeds import build_seeds_prompt
+    from seeds_schema import validate_seeds_spec
 
 
 def _choose_src_root(root: Path) -> Path:
