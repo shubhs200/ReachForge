@@ -47,8 +47,9 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt
 COPY . .
 
-# Environment for runtime
-ENV PYTHONPATH=/opt/reachforge
+# Environment for runtime: ensure parent dir of the package is on sys.path
+# This allows `python3 -m reachforge.cli` to work from any CWD in the container
+ENV PYTHONPATH=/opt
 
 # Default command prints help
-CMD ["python3", "/opt/reachforge/cli.py", "--help"]
+CMD ["python3", "-m", "reachforge.cli", "--help"]

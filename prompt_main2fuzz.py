@@ -4,9 +4,15 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .schema import DRIVER_SPEC_SCHEMA
-from .source_index import find_entry_main_and_context, build_source_summaries
-from .poller_index import build_poller_summary
+# Support both package and script execution
+try:
+    from .schema import DRIVER_SPEC_SCHEMA
+    from .source_index import find_entry_main_and_context, build_source_summaries
+    from .poller_index import build_poller_summary
+except ImportError:  # Fallback when run as a script (no package parent)
+    from schema import DRIVER_SPEC_SCHEMA
+    from source_index import find_entry_main_and_context, build_source_summaries
+    from poller_index import build_poller_summary
 
 
 def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = False, include_poller: bool = True) -> Optional[Path]:
