@@ -1,36 +1,25 @@
-# GitLab CI for ReachForge (self-contained)
-# Runs the ReachForge pipeline: generate driver + seeds, fuzz with AFL++, replay crashes, and keep artifacts.
-# Set OPENAI_API_KEY as a protected CI/CD variable in GitLab.
-
 stages:
-  - reachforge
+  - build
+  - test
+  - publish
 
-reachforge:
-  stage: reachforge
-  image: python:3.11
-  variables:
-    # Path to the target project root within this repo (must contain app/src or src)
-    TARGET_ROOT: "analyze-image"
-    # Fuzzing time budget in hours (default 5)
-    FUZZ_HOURS: "5"
+# Basic sanity checks and validation
+validate:rf:
+  stage: test
+  image: python:3.12
   before_script:
-    - python3 --version
-    # Install AFL++ (try common package names)
-    - apt-get update -y
-    - apt-get install -y --no-install-recommends afl++ || apt-get install -y --no-install-recommends aflplusplus || true
-    # Install Python deps for LLM adapter
-    - pip install --no-cache-dir -r requirements.txt
-    # Basic validation
-    - bash scripts/ci-validate.sh
+    - python -m pip install --upgrade pip
   script:
-    - bash scripts/ci-run.sh "$TARGET_ROOT" "$FUZZ_HOURS"
+    - chmod +x scripts/ci-validate.sh || true
+    - ./scripts/ci-validate.sh
+  allow_failure: false
+
+# Build and publish ReachForge CI image
+publish:docker-image:
+  stage: publish
+  image:
+    name: ${CI_REGISTRY}/general/docker-images/docker-builder:latest
+  script:
+    - TAGS=git-${CI_COMMIT_SHORT_SHA} NAME=reachforge-1.0 DOCKERFILE=Dockerfile.ci /build.sh
   artifacts:
-    when: always
     expire_in: 1 week
-    paths:
-      # Common locations regardless of nested target
-      - "**/reachforge2_out/**/*"
-      - "reachforge2_out/**/*"
-      - "*/reachforge2_out/**/*"
-  rules:
-    - when: on_success

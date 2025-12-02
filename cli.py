@@ -534,10 +534,73 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
         if rc != 0:
             return rc
 
+    # 6.5) Create compatibility layout for downstream CI expecting fuzz-out structure
+    try:
+        app_name = root.name
+        compat_bin = out / "fuzz_driver"
+        if compat_bin.exists():
+            try:
+                compat_bin.unlink()
+            except Exception:
+                pass
+        # Prefer symlink to the compiled binary; fallback to copy
+        try:
+            compat_bin.symlink_to(binary_path)
+        except Exception:
+            try:
+                compat_bin.write_bytes(binary_path.read_bytes())
+            except Exception:
+                pass
+        # Expose driver source at top-level for convenience (copy)
+        try:
+            driver_src_top = out / f"{binary_path.name}.c"
+            if src_path.suffix:
+                driver_src_top = out / f"{binary_path.name}{src_path.suffix}"
+            driver_src_top.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+        # Seeds -> afl_in
+        afl_in = out / "afl_in"
+        seeds_src = out / "seeds" / app_name
+        if not seeds_src.exists():
+            seeds_src = afl_in  # will be ensured below
+        if afl_in.exists():
+            try:
+                import shutil as _sh
+                if afl_in.is_symlink() or afl_in.is_file():
+                    afl_in.unlink()
+                elif afl_in.is_dir():
+                    _sh.rmtree(afl_in)
+            except Exception:
+                pass
+        try:
+            afl_in.symlink_to(seeds_src)
+        except Exception:
+            # Fallback: copy tree
+            try:
+                import shutil as _sh
+                _sh.copytree(seeds_src, afl_in)
+            except Exception:
+                pass
+        _ensure_seed_dir(afl_in)
+        # Ensure afl_out exists
+        (out / "afl_out").mkdir(parents=True, exist_ok=True)
+        # Provide a file-arg wrapper so AFL '@@' workflows stay compatible
+        try:
+            wrapper = out / "fuzz_driver_filearg"
+            script = "#!/usr/bin/env bash\nset -euo pipefail\nFILE=\"${1:-}\"\nif [[ -z \"$FILE\" || ! -f \"$FILE\" ]]; then echo 'usage: fuzz_driver_filearg <file>' >&2; exit 2; fi\nexec \"${0%/*}/fuzz_driver\" < \"$FILE\"\n"
+            wrapper.write_text(script, encoding="utf-8")
+            wrapper.chmod(0o755)
+        except Exception:
+            pass
+        print(f"[rf2] CI compat: binary={compat_bin} seeds={afl_in} afl_out={out / 'afl_out'}")
+    except Exception as e:
+        print(f"[rf2] CI compat layout warning: {e}")
+
     # 7) Optional fuzzing stage with AFL++ (default: enabled unless --no-run-fuzz)
     if getattr(args, "run_fuzz", True):
         app_name = root.name
-        seeds_dir = out / "seeds" / app_name
+        seeds_dir = out / "afl_in"  # use compat path so downstream jobs align
         # Pre-screen seeds: remove any that crash or time out to allow AFL startup
         kept, rejected, rej_dir = _filter_bad_seeds(binary_path, seeds_dir, timeout_sec=2)
         print(f"[rf2] Seeds prescreen: kept={kept}, rejected={rejected}, rejected_dir={rej_dir}")
