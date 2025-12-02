@@ -100,11 +100,55 @@ def get_compile_cmd(app_root: str, app_name: str) -> str | None:
 
 
 def generate_compile_cmd_template(app_root: str | None = None, app_name: str | None = None) -> str:
-    # If we have a per-app rule, use it
+    """Return a compile command template.
+    For analyze-image/challenge, auto-detect the vcpkg triplet (ellf vs cromulence)
+    by probing the filesystem under <app_root>/build/vcpkg_installed/.
+    """
+    from pathlib import Path as _P
+
+    ar = _P(app_root).resolve() if app_root else _P('.')
+
+    def _pick_triplet(root: _P) -> str:
+        candidates = [
+            "x64-linux-ellf",
+            "x64-linux-cromulence",
+        ]
+        base = root / "build" / "vcpkg_installed"
+        for t in candidates:
+            if (base / t / "include").exists():
+                return t
+        # Fallback to ellf if nothing found
+        return "x64-linux-ellf"
+
+    # Dynamic handling for our known apps
+    if app_name in {"analyze-image", "challenge"}:
+        trip = _pick_triplet(ar)
+        inc = f"build/vcpkg_installed/{trip}/include"
+        lib = f"build/vcpkg_installed/{trip}/lib"
+        return (
+            'bash -lc "AFL_USE_ASAN=1 '
+            'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+            f'-I. -Iapp/src -I{inc} '
+            '{src} '
+            '-o {binary} '
+            f'{lib}/libturbojpeg.a '
+            f'{lib}/libtiff.a '
+            f'{lib}/libopenjp2.a '
+            f'{lib}/libjpeg.a '
+            f'{lib}/libz.a '
+            f'{lib}/libmicrohttpd.a '
+            f'{lib}/libpng16.a '
+            f'{lib}/liblzma.a '
+            f'{lib}/libgif.a '
+            '-lm -ldl -lpthread"'
+        )
+
+    # If we have a per-app static rule, use it
     if app_name:
         cmd = get_compile_cmd(app_root or "", app_name)
         if cmd:
             return cmd
+
     # Fallback generic: tune includes/libs as needed for your environment
     return (
         'bash -lc "'
