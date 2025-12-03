@@ -143,6 +143,29 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
             '-lm -ldl -lpthread"'
         )
 
+    if app_name == "lamartine":
+        trip = _pick_triplet(ar)
+        inc = f"build/vcpkg_installed/{trip}/include"
+        inc_xml = f"build/vcpkg_installed/{trip}/include/libxml2"
+        lib = f"build/vcpkg_installed/{trip}/lib"
+        # C++ target with many project sources; {src} is the generated harness
+        return (
+            'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
+            'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
+            '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
+            '-I. -Isrc '
+            f'-I {inc} -I {inc_xml} '
+            '-o {binary} {src} '
+            'src/assert.cpp src/base64.cpp src/error_processor.cpp src/session.cpp src/share_finder.cpp '
+            'src/util_env.cpp src/util_rand.cpp src/var_finder.cpp src/watcher.cpp '
+            'src/doom/map.cpp src/doom/pwad.cpp src/doom/svg_writer.cpp src/doom/udmf_parser.cpp '
+            'src/tpl/base.cpp src/tpl/index.cpp src/tpl/map.cpp src/tpl/upload.cpp '
+            f'{lib}/libsodium.a '
+            f'{lib}/libxml2.a '
+            f'{lib}/libz.a '
+            '-ldl -lm"'
+        )
+
     # If we have a per-app static rule, use it
     if app_name:
         cmd = get_compile_cmd(app_root or "", app_name)
