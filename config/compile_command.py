@@ -52,7 +52,7 @@ APP_RULES = {
     ),
     "challenge": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+        'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
         '-I. -Iapp/src -Ibuild/vcpkg_installed/x64-linux-ellf/include '
         '{src} '
         '-o {binary} '
