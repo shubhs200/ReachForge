@@ -585,14 +585,7 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
         _ensure_seed_dir(afl_in)
         # Ensure afl_out exists
         (out / "afl_out").mkdir(parents=True, exist_ok=True)
-        # Provide a file-arg wrapper so AFL '@@' workflows stay compatible
-        try:
-            wrapper = out / "fuzz_driver_filearg"
-            script = "#!/usr/bin/env bash\nset -euo pipefail\nFILE=\"${1:-}\"\nif [[ -z \"$FILE\" || ! -f \"$FILE\" ]]; then echo 'usage: fuzz_driver_filearg <file>' >&2; exit 2; fi\nexec \"${0%/*}/fuzz_driver\" < \"$FILE\"\n"
-            wrapper.write_text(script, encoding="utf-8")
-            wrapper.chmod(0o755)
-        except Exception:
-            pass
+        # Note: Wrapper script for '@@' is no longer created; fuzz directly via stdin
         print(f"[rf2] CI compat: binary={compat_bin} seeds={afl_in} afl_out={out / 'afl_out'}")
     except Exception as e:
         print(f"[rf2] CI compat layout warning: {e}")
