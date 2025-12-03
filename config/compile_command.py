@@ -24,7 +24,7 @@ APP_RULES = {
     # mqtt-server (mongoose)
     "mqtt-server": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang-fast -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-I mqtt-server/app/src '
         '-I /home/shubham/ReachForge/mqtt-server/build/vcpkg_installed/x64-linux-cromulence/include '
         '{src} '
@@ -69,8 +69,8 @@ APP_RULES = {
     ),
     # lamartine (header-only external includes via vcpkg_installed if present)
     "lamartine": (
-        'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang-fast++ '
-        'afl-clang-fast++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
+        'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
+        'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
         '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
         '-I. -Isrc '
         '-I build/vcpkg_installed/x64-linux-cromulence/include '
@@ -87,7 +87,7 @@ APP_RULES = {
     ),
     "cjson": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang-fast -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-I. '
         '-o {binary} {src} '
         'cJSON.c cJSON_Utils.c"'
@@ -127,7 +127,7 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
         lib = f"build/vcpkg_installed/{trip}/lib"
         return (
             'bash -lc "AFL_USE_ASAN=1 '
-            'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+            'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
             f'-I. -Iapp/src -I{inc} '
             '{src} '
             '-o {binary} '
@@ -152,7 +152,7 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
     # Fallback generic: tune includes/libs as needed for your environment
     return (
         'bash -lc "'
-        'afl-clang-fast -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-o {binary} {src} '
         '-I. -L. -lm -lpthread"'
     )
