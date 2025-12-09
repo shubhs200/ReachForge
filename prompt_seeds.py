@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from seeds_schema import SEEDS_SPEC_SCHEMA
-from poller_index import build_poller_summary
+from reachforge.seeds_schema import SEEDS_SPEC_SCHEMA
+from reachforge.poller_index import build_poller_summary
 
 
 def _load_vulns(root: Path) -> list[dict]:
