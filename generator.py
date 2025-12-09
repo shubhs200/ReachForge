@@ -4,8 +4,8 @@ import re
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
-from schema import validate_driver_spec
-from source_index import find_entry_main_and_context
+from reachforge.schema import validate_driver_spec
+from reachforge.source_index import find_entry_main_and_context
 
 
 def _compose_includes(includes: list[str]) -> str:
