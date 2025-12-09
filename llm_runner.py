@@ -185,8 +185,11 @@ def _extract_json_object(reply: str) -> str | None:
     prose, code fences, or trailing text. Strategy:
       1) Strip code fences if present and test for pure JSON.
       2) Scan the whole reply for the first balanced {...} block and validate as JSON.
+      3) Attempt to repair common JSON issues (unterminated strings, trailing commas).
     Returns the JSON string if found, else None.
     """
+    import re
+
     # 1) Strip code fences, try direct parse
     stripped = _strip_code_fences(reply)
     if _is_json_object(stripped):
@@ -220,13 +223,31 @@ def _extract_json_object(reply: str) -> str | None:
                     depth -= 1
                     if depth == 0 and start != -1:
                         candidate = s[start : i + 1]
-                        # Validate JSON
+                        # Try to parse as JSON
                         try:
                             json.loads(candidate)
                             return candidate
                         except Exception:
-                            # Continue searching in case there is another block later
-                            start = -1
+                            # Attempt to repair common JSON issues
+                            repaired = candidate
+                            # Remove trailing commas before } or ]
+                            repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+                            # Attempt to close unterminated strings (add a quote if odd number of quotes)
+                            if repaired.count('"') % 2 == 1:
+                                repaired += '"'
+                            try:
+                                json.loads(repaired)
+                                return repaired
+                            except Exception:
+                                # Log the raw candidate for debugging
+                                try:
+                                    with open("llm_seeds_json_error.log", "w", encoding="utf-8") as f:
+                                        f.write("Malformed JSON candidate:\n")
+                                        f.write(candidate)
+                                except Exception:
+                                    pass
+                                # Continue searching in case there is another block later
+                                start = -1
     return None
 
 
@@ -257,7 +278,7 @@ def _run_iterative_openai_json(prompt_path: Path, out_spec: Path, *, model: str,
     Builds an augmented prompt with a file index; serves FETCH: requests with clipped file contents.
     """
     try:
-        from .llm_adapters.openai import run_openai_json  # bundled
+        from llm_adapters.openai import run_openai_json  # bundled
     except Exception:
         try:
             from reachforge.llm_openai import run_openai_json  # legacy fallback
@@ -450,7 +471,7 @@ def run_llm_seeds_spec(prompt_path: Path, out_spec: Path, *, llm_cmd: Optional[s
         return False, "No seeds LLM model configured. Use --seeds-model or set REACHFORGE4_SEEDS_MODEL (or legacy REACHFORGE2_MODEL), or configure reachforge4/config/llm.json."
 
     try:
-        from .llm_adapters.openai import run_openai_json  # bundled
+        from llm_adapters.openai import run_openai_json  # bundled
     except Exception:
         try:
             from reachforge.llm_openai import run_openai_json  # legacy fallback

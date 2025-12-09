@@ -100,22 +100,14 @@ def find_entry_main_and_context(root: Path, *, aux_files_cap: int = 8, aux_clip_
     main_file: Optional[Path] = None
     main_text: Optional[str] = None
 
-    # Prefer files literally named main.c/main.cc if multiple mains exist
-    candidates = [p for p in files if p.name.lower().startswith("main.")]
-    if candidates:
-        for p in candidates:
-            txt = _read_text(p)
-            if _has_main(txt):
-                main_file, main_text = p, txt
-                break
-
-    if main_file is None:
-        # Fallback: scan for first file that has main()
-        for p in files:
-            txt = _read_text(p)
-            if _has_main(txt):
-                main_file, main_text = p, txt
-                break
+    # Scan all source files for the first file that defines int main()
+    for p in files:
+        txt = _read_text(p)
+        # Debug: print which file is being checked and if main is found
+        # print(f"Checking {p}: {'FOUND main' if _has_main(txt) else 'no main'}")
+        if _has_main(txt):
+            main_file, main_text = p, txt
+            break
 
     if main_file is None or not main_text:
         return None
