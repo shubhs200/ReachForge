@@ -168,7 +168,7 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
 
     collected_inputs = []
     if poller_dir.exists():
-        ignored_exts = {".py", ".rb", ".sh", ".txt", ".md", ".json", ".yml", ".yaml", ".Dockerfile"}
+        ignored_exts = {".py", ".rb", ".sh", ".txt", ".md", ".json", ".yml", ".yaml", ".Dockerfile", ".poller"}
         for dirpath, _, filenames in os.walk(poller_dir):
             for f in filenames:
                 fpath = Path(dirpath) / f
