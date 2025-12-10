@@ -32,7 +32,8 @@ APP_RULES = {
         '/home/shubham/ReachForge/mqtt-server/build/vcpkg_installed/x64-linux-cromulence/lib/libmongoose.a '
         '-lpthread -lm"'
     ),
-    # analyze-image (static libs via vcpkg_installed/x64-linux-cromulence)
+
+    # analyze-image
     "analyze-image": (
         'bash -lc "AFL_USE_ASAN=1 '
         'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
@@ -50,29 +51,8 @@ APP_RULES = {
         'build/vcpkg_installed/x64-linux-ellf/lib/libgif.a '
         '-lm -ldl -lpthread"'
     ),
-    "image-histogram": (
-        'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
-        '-I. -Iapp/src -Ibuild/vcpkg_installed/x64-linux-cromulence/include '
-        '{src} app/src/image.c '
-        '-o {binary} '
-        '-Wl,--start-group '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libturbojpeg.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libtiff.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libopenjp2.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libjpeg.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libpng16.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libwebp.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libgif.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libraw_r.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libmagic.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libjasper.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/liblcms2.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libz.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/liblzma.a '
-        '-Wl,--end-group '
-        '-lstdc++ -lm -ldl -lpthread"'
-    ),
+
+    # challenge
     "challenge": (
         'bash -lc "AFL_USE_ASAN=1 '
         'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
@@ -90,7 +70,8 @@ APP_RULES = {
         'build/vcpkg_installed/x64-linux-ellf/lib/libgif.a '
         '-lm -ldl -lpthread"'
     ),
-    # lamartine (header-only external includes via vcpkg_installed if present)
+
+    # lamartine
     "lamartine": (
         'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
         'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
@@ -108,6 +89,8 @@ APP_RULES = {
         'build/vcpkg_installed/x64-linux-cromulence/lib/libz.a '
         '-ldl -lm"'
     ),
+
+    # cjson
     "cjson": (
         'bash -lc "AFL_USE_ASAN=1 '
         'afl-clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
@@ -123,28 +106,25 @@ def get_compile_cmd(app_root: str, app_name: str) -> str | None:
 
 
 def generate_compile_cmd_template(app_root: str | None = None, app_name: str | None = None) -> str:
-    """Return a compile command template.
-    For analyze-image/challenge, auto-detect the vcpkg triplet (ellf vs cromulence)
-    by probing the filesystem under <app_root>/build/vcpkg_installed/.
-    """
+    """Dynamic compile command template with vcpkg triplet auto-detection."""
     from pathlib import Path as _P
 
     ar = _P(app_root).resolve() if app_root else _P('.')
 
     def _pick_triplet(root: _P) -> str:
-        candidates = [
-            "x64-linux-ellf",
-            "x64-linux-cromulence",
-        ]
+        candidates = ["x64-linux-ellf", "x64-linux-cromulence"]
         base = root / "build" / "vcpkg_installed"
         for t in candidates:
             if (base / t / "include").exists():
                 return t
-        # Fallback to ellf if nothing found
         return "x64-linux-ellf"
 
-    # Dynamic handling for our known apps
+    # analyze-image and challenge handled by APP_RULES
     if app_name in {"analyze-image", "challenge"}:
+        return get_compile_cmd(app_root or "", app_name)
+
+    # NEW: dynamic rule for image-histogram
+    if app_name == "image-histogram":
         trip = _pick_triplet(ar)
         inc = f"build/vcpkg_installed/{trip}/include"
         lib = f"build/vcpkg_installed/{trip}/lib"
@@ -152,50 +132,35 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
             'bash -lc "AFL_USE_ASAN=1 '
             'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
             f'-I. -Iapp/src -I{inc} '
-            '{src} '
+            '{src} app/src/image.c '
             '-o {binary} '
+            '-Wl,--start-group '
             f'{lib}/libturbojpeg.a '
             f'{lib}/libtiff.a '
             f'{lib}/libopenjp2.a '
             f'{lib}/libjpeg.a '
-            f'{lib}/libz.a '
-            f'{lib}/libmicrohttpd.a '
             f'{lib}/libpng16.a '
-            f'{lib}/liblzma.a '
+            f'{lib}/libwebp.a '
             f'{lib}/libgif.a '
-            '-lm -ldl -lpthread"'
-        )
-
-    if app_name == "lamartine":
-        trip = _pick_triplet(ar)
-        inc = f"build/vcpkg_installed/{trip}/include"
-        inc_xml = f"build/vcpkg_installed/{trip}/include/libxml2"
-        lib = f"build/vcpkg_installed/{trip}/lib"
-        # C++ target with many project sources; {src} is the generated harness
-        return (
-            'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
-            'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
-            '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
-            '-I. -Isrc '
-            f'-I {inc} -I {inc_xml} '
-            '-o {binary} {src} '
-            'src/assert.cpp src/base64.cpp src/error_processor.cpp src/session.cpp src/share_finder.cpp '
-            'src/util_env.cpp src/util_rand.cpp src/var_finder.cpp src/watcher.cpp '
-            'src/doom/map.cpp src/doom/pwad.cpp src/doom/svg_writer.cpp src/doom/udmf_parser.cpp '
-            'src/tpl/base.cpp src/tpl/index.cpp src/tpl/map.cpp src/tpl/upload.cpp '
-            f'{lib}/libsodium.a '
-            f'{lib}/libxml2.a '
+            f'{lib}/libraw_r.a '
+            f'{lib}/libmagic.a '
+            f'{lib}/libjasper.a '
+            f'{lib}/liblcms2.a '
             f'{lib}/libz.a '
-            '-ldl -lm"'
+            f'{lib}/liblzma.a '
+            '-Wl,--end-group '
+            '-lstdc++ -lm -ldl -lpthread"'
         )
 
-    # If we have a per-app static rule, use it
-    if app_name:
-        cmd = get_compile_cmd(app_root or "", app_name)
-        if cmd:
-            return cmd
+    # lamartine handled by APP_RULES
+    if app_name == "lamartine":
+        return get_compile_cmd(app_root or "", app_name)
 
-    # Fallback generic: tune includes/libs as needed for your environment
+    # fallback
+    cmd = get_compile_cmd(app_root or "", app_name)
+    if cmd:
+        return cmd
+
     return (
         'bash -lc "'
         'afl-clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
