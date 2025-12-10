@@ -157,7 +157,41 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
     """
     Build seeds prompt (using vulnerabilities.json + DriverSpec), ask LLM for SeedsSpec (10 seeds),
     validate, decode, and write to out/seeds/<app>.
+    Before generating, check for existing poller inputs recursively and use them if available.
     """
+    import shutil, os
+
+    app_name = root.name
+    poller_dir = root / "poller"
+    seeds_target = (out / "seeds" / app_name).resolve()
+    seeds_target.mkdir(parents=True, exist_ok=True)
+
+    collected_inputs = []
+    if poller_dir.exists():
+        ignored_exts = {".py", ".rb", ".sh", ".txt", ".md", ".json", ".yml", ".yaml", ".Dockerfile"}
+        for dirpath, _, filenames in os.walk(poller_dir):
+            for f in filenames:
+                fpath = Path(dirpath) / f
+                ext = fpath.suffix.lower()
+                if ext in ignored_exts:
+                    continue
+                try:
+                    if fpath.is_file() and fpath.stat().st_size > 0:
+                        collected_inputs.append(fpath)
+                except Exception:
+                    continue
+
+    if collected_inputs:
+        print(f"[rf2] Found {len(collected_inputs)} poller inputs, using them as seeds.")
+        for inp in collected_inputs:
+            try:
+                shutil.copy(inp, seeds_target / inp.name)
+            except Exception as e:
+                print(f"[rf2] Warning: failed to copy {inp}: {e}")
+        print(f"[rf2] Seeds collected from poller: {seeds_target}")
+        return 0
+
+    # No poller inputs found, proceed with LLM-based generation
     prompt = build_seeds_prompt(root, out)
     if not prompt:
         print("[rf2] Seeds: prerequisites missing (no driver/spec or no context). Skipping.")
@@ -179,7 +213,6 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
         print(f"[rf2] Seeds: validation failed: {err}")
         return 3
     # Write seed files
-    app_name = root.name
     ok, wmsg, target = _write_seeds_files(spec, out, app_name)
     if not ok:
         print(f"[rf2] Seeds: write failed: {wmsg}")
