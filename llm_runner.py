@@ -281,7 +281,7 @@ def _run_iterative_openai_json(prompt_path: Path, out_spec: Path, *, model: str,
         from llm_adapters.openai import run_openai_json  # bundled
     except Exception:
         try:
-            from reachforge.llm_openai import run_openai_json  # legacy fallback
+            from reachforge.llm_adapters.openai import run_openai_json  # legacy fallback
         except Exception as e:
             return False, f"missing LLM adapter: {e}"
 
@@ -474,7 +474,7 @@ def run_llm_seeds_spec(prompt_path: Path, out_spec: Path, *, llm_cmd: Optional[s
         from llm_adapters.openai import run_openai_json  # bundled
     except Exception:
         try:
-            from reachforge.llm_openai import run_openai_json  # legacy fallback
+            from reachforge.llm_adapters.openai import run_openai_json  # legacy fallback
         except Exception as e:
             return False, f"missing LLM adapter: {e}"
 

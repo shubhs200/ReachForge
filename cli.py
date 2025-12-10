@@ -98,7 +98,7 @@ def _auto_lift_from_entry(root: Path, out: Path, lift: set[str]) -> bool:
     Returns True if any were added.
     """
     # Lazy import to avoid cyclics
-    from source_index import find_entry_main_and_context
+    from reachforge.source_index import find_entry_main_and_context
 
     log_path = (out / "compile.log.txt").resolve()
     symbols = _parse_undefined_symbols(log_path)

@@ -11,7 +11,7 @@ try:
     from .poller_index import build_poller_summary
 except ImportError:  # Fallback when run as a script (no package parent)
     from schema import DRIVER_SPEC_SCHEMA
-    from source_index import find_entry_main_and_context, build_source_summaries
+    from reachforge.source_index import find_entry_main_and_context, build_source_summaries
     from poller_index import build_poller_summary
 
 
