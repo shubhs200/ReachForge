@@ -56,8 +56,8 @@ APP_RULES = {
     "challenge": (
         'bash -lc "AFL_USE_ASAN=1 '
         'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
-        '-I. -Iapp/src -Ibuild/vcpkg_installed/x64-linux-cromulence/include '
-        '{src} app/src/image.c '
+        '-I. -Iimage-histogram/app/src -Ibuild/vcpkg_installed/x64-linux-cromulence/include '
+        '{src} image-histogram/app/src/image.c '
         '-o {binary} '
         '-Wl,--start-group '
         'build/vcpkg_installed/x64-linux-cromulence/lib/libturbojpeg.a '
