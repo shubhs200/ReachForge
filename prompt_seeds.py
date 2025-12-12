@@ -57,6 +57,7 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
             "cwe_name": v.get("cwe-name"),
             "affected_function": v.get("affected-function"),
             "affected_file": v.get("affected-file"),
+            "expected_format": v.get("input-format") or v.get("format") or v.get("protocol"),
         })
 
     # Poller insights (optional)
@@ -100,8 +101,10 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append("- Include boundary conditions (length fields near overflow/underflow, minimal/maximal topic/field sizes, etc.)")
         lines.append("Mandatory vulnerability alignment:")
         lines.append("- Produce seeds that explicitly target the functions/files listed above (e.g., LibRaw -> RAW/CR2 blobs, libwebp -> WebP frames, LibTIFF -> TIFF headers).")
-        lines.append("- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE in each seed's 'notes' field.")
+        lines.append("- Each seed must conform to the expected input format listed in vulnerabilities.json (e.g., TIFF/JPEG/WebP framing, LibRaw RAW structures, MQTT control packets).")
+        lines.append("- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE and expected_format in each seed's 'notes' field.")
         lines.append("- Shape headers/magic bytes/metadata so that the vulnerable functions are exercised as directly as possible; bias field lengths and chunk layouts toward the affected code paths.")
+        lines.append("- When a vulnerability references an image format with specific color planes, chunk names, or compression types, mirror those details in the seed content (e.g., TIFF IFD tags, WebP VP8L chunks, LibRaw TIFF/CR2 block layouts).")
     else:
         lines.append("No vulnerabilities.json found; still produce 10 diverse seeds that exercise parsing.")
     lines.append("")
