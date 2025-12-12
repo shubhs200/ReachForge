@@ -154,6 +154,16 @@ def _write_seeds_files(spec: dict, out_dir: Path, app_name: str) -> tuple[bool, 
     return True, "ok", target
 
 
+def _canonicalize_driver_filename(spec: dict) -> None:
+    lang = (spec.get("language") or "").strip().lower()
+    spec["driver_filename"] = "fuzz_driver.cc" if lang == "c++" else "fuzz_driver.c"
+
+
+def _persist_driver_spec(spec: dict, path: Path) -> None:
+    _canonicalize_driver_filename(spec)
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+
 def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: str | None = None, api_base: str | None = None) -> int:
     """
     Build seeds prompt (using vulnerabilities.json + DriverSpec), ask LLM for SeedsSpec (10 seeds),
@@ -440,6 +450,7 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     # 3) Load and validate spec
     try:
         spec = json.loads(out_spec.read_text(encoding="utf-8"))
+        _canonicalize_driver_filename(spec)
     except Exception as e:
         print(f"[rf2] Error: failed to parse DriverSpec JSON: {e}")
         return 3
@@ -447,6 +458,7 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     if not ok:
         print(f"[rf2] DriverSpec validation failed: {err}")
         return 3
+    _persist_driver_spec(spec, out_spec)
 
     # 4) Generate driver source file
     app_name = root.name
@@ -454,6 +466,11 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     if not ok:
         print(f"[rf2] Driver generation failed: {gmsg}")
         return 3
+
+    # Ensure binary name stays consistent even if the LLM attempted to change it
+    spec["driver_filename"] = "fuzz_driver.cc" if src_path.suffix == ".cc" else "fuzz_driver.c"
+    src_path = src_path.parent / spec["driver_filename"]
+    src_path.write_text(src_path.read_text(encoding="utf-8"), encoding="utf-8")
     print(f"[rf2] Driver source: {src_path}")
 
     # 5) Compile using existing compile templates
