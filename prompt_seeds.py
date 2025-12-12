@@ -98,6 +98,10 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append("- Derive tokens/fields/lengths from affected functions/files. Create seeds that are valid-ish or near-boundary inputs to reach parsing code.")
         lines.append("- Cover a variety of control paths (e.g., CONNECT/SUBSCRIBE/PUBLISH for MQTT; or format variants for image).")
         lines.append("- Include boundary conditions (length fields near overflow/underflow, minimal/maximal topic/field sizes, etc.)")
+        lines.append("Mandatory vulnerability alignment:")
+        lines.append("- Produce seeds that explicitly target the functions/files listed above (e.g., LibRaw -> RAW/CR2 blobs, libwebp -> WebP frames, LibTIFF -> TIFF headers).")
+        lines.append("- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE in each seed's 'notes' field.")
+        lines.append("- Shape headers/magic bytes/metadata so that the vulnerable functions are exercised as directly as possible; bias field lengths and chunk layouts toward the affected code paths.")
     else:
         lines.append("No vulnerabilities.json found; still produce 10 diverse seeds that exercise parsing.")
     lines.append("")

@@ -16,11 +16,12 @@ except ImportError:  # Fallback when run as a script (no package parent)
 
 
 def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = False, include_poller: bool = True) -> Optional[Path]:
-    """
-    Build a source-first 'main-to-fuzz' prompt:
-      - Full entrypoint (file with int main)
-      - Bounded auxiliary snippets referenced by main (headers/sources)
-      - Strict DriverSpec JSON schema and guardrails
+    """Build a source-first 'main-to-fuzz' prompt.
+
+    - Full entrypoint (file with int main)
+    - Bounded auxiliary snippets referenced by main (headers/sources)
+    - Strict DriverSpec JSON schema and guardrails
+
     Returns the path to the prompt file (markdown), or None if context cannot be built.
     """
     root = root.resolve()
@@ -66,6 +67,7 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
             lines.append(poller_summary)
             lines.append("Use these insights to select a single-shot call path and realistic input shapes; do NOT implement servers/sockets or loops.")
             lines.append("")
+
     lines.append("You are given an application's entrypoint (file that contains int main) and a handful of supporting source snippets.")
     lines.append("Your task: output ONLY a DriverSpec JSON (no prose, no code fences) that defines a brand-new, single-shot fuzz driver (a separate program).")
     lines.append("")
@@ -102,7 +104,6 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
         lines.append("Prefer calling functions/files that are listed as affected when possible, while staying deterministic and single-shot.")
         lines.append("")
 
-
     # Context: source summaries (overview)
     try:
         summaries = build_source_summaries(root)
@@ -112,6 +113,7 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
         lines.append("Project source summaries (functions and includes):")
         lines.append(summaries)
         lines.append("")
+
     # Entry-defined helper functions available to lift verbatim
     try:
         entry_funcs_json = ctx.notes.get("entry_defined_funcs", "")
@@ -122,6 +124,7 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
             lines.append("")
     except Exception:
         pass
+
     # Context: entrypoint (full)
     lines.append("Entry file (complete):")
     lines.append(f"// file: {ctx.main_file.path}")
@@ -142,5 +145,201 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
     prompt_dir = out_dir / "context"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = prompt_dir / "prompt.main2fuzz.md"
+    prompt_path.write_text("\n".join(lines), encoding="utf-8")
+    return prompt_path
+
+
+def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path]:
+    """Build an AFG-augmented DriverSpec prompt.
+
+    This variant incorporates a vulnerability-focused Abstract Fuzz Graph (AFG)
+    derived from vulnerabilities.json together with the single entry translation
+    unit that defines int main(). Unlike build_main2fuzz_prompt, this mode does
+    NOT include global source summaries; the model must reason mainly from the
+    entry file and the AFG.
+    """
+    root = root.resolve()
+    out_dir = out_dir.resolve()
+
+    # Reuse the entry context for main
+    ctx = find_entry_main_and_context(root)
+    if not ctx:
+        return None
+
+    # Load AFG JSON (best-effort)
+    try:
+        afg = json.loads(Path(afg_path).read_text(encoding="utf-8"))
+    except Exception:
+        afg = {}
+
+    # Optional vulnerabilities summary (for labeling AFG nodes)
+    vulns_data: dict[str, object] | list[object] | None = None
+    for vp in [root / "vulnerabilities.json", root / "app" / "vulnerabilities.json"]:
+        if vp.exists():
+            try:
+                vulns_data = json.loads(vp.read_text(encoding="utf-8"))
+            except Exception:
+                vulns_data = None
+            break
+
+    lines: list[str] = []
+    lines.append("You are generating a DriverSpec JSON for a single-shot, deterministic fuzz driver.")
+    lines.append("")
+    lines.append("You are given:")
+    lines.append("- An Abstract Fuzz Graph (AFG) derived from vulnerabilities.json, focusing on vulnerable APIs and sinks.")
+    lines.append("- The application's entry file that contains int main (shows how the program is normally configured and used).")
+    lines.append("")
+    lines.append("Your task: output ONLY a DriverSpec JSON (no prose, no code fences) that defines a brand-new, single-shot fuzz driver (a separate program).")
+    lines.append("")
+    lines.append("The driver must:")
+    lines.append("- Read stdin into a bounded buffer (cap to a safe limit).")
+    lines.append("- Build just enough state/context to exercise one or more vulnerable or high-risk APIs identified in the AFG, in a deterministic, single-shot manner.")
+    lines.append("- Avoid reproducing servers, event loops, signal handlers, or threads from main; instead, construct the minimal objects needed and invoke the core logic once.")
+    lines.append("- Ignore benign parse errors; then cleanup and return 0.")
+    lines.append("- Do NOT modify any existing source files. Produce a new program only.")
+    lines.append("- This repository uses AFL++-style stdin harnesses: your generated 'driver_source' MUST contain exactly one program entrypoint: 'int main(...)'.")
+    lines.append("- DO NOT define or reference any libFuzzer/LLVM entrypoints (forbidden tokens: LLVMFuzzerTestOneInput, LLVMFuzzerInitialize, LLVMFuzzerCustomMutator, LLVMFuzzerCustomCrossOver).")
+    lines.append("- DO NOT include or mention sanitizer/libFuzzer runtime APIs; all fuzz input must be read from stdin inside main().")
+    lines.append("")
+    lines.append("Decision guidance using main() + AFG:")
+    lines.append("- Your driver MUST directly or indirectly invoke at least one function that is marked as vulnerable in vulnerabilities.json (affected-function) or appears as an 'api_' node in the AFG.")
+    lines.append("- Do NOT design the driver around unrelated parsers or subsystems that are not mentioned in vulnerabilities.json / the AFG; focus your call sequence on the vulnerable APIs.")
+    lines.append("- Use the entry file to understand how the application normally routes or processes input (e.g., request/response types, configuration, helper objects).")
+    lines.append("- Use the AFG to choose which APIs and call paths to target. Prefer API nodes that lead directly to sinks in the AFG.")
+    lines.append("- Map fuzzer bytes from stdin to the logical inputs used in those paths (for example, query parameters, request bodies, filenames, or template data), so that the vulnerable APIs see realistic but adversarial data.")
+    lines.append("- If main configures a long-running server, do not start a server in the fuzz driver. Instead, instantiate the same request/handler objects in-process and call the vulnerable logic exactly once per fuzz iteration.")
+    lines.append("")
+
+    # DriverSpec schema reminder
+    lines.append("DriverSpec JSON (schema reminder; DO NOT add extra fields or text):")
+    lines.append(json.dumps(DRIVER_SPEC_SCHEMA, indent=2))
+    lines.append("")
+    lines.append("Output format constraints:")
+    lines.append("- Output strictly a single JSON object conforming to the DriverSpec schema.")
+    lines.append("- No code fences, no commentary, no explanations outside of the allowed 'notes' field (1-2 short lines).")
+    lines.append("- 'driver_source' must contain a complete, compilable single-shot program in the language specified.")
+    lines.append("- 'includes' must use project-relative quoted headers and allowed externals visible in the entry file and any headers it includes.")
+    lines.append("- If a function expects a file path or FILE*, write the buffer to a temp file in-driver and pass it.")
+    lines.append("- If the functions you will call are declared in headers but implemented in project sources, populate 'extra_sources' with the required .c/.cc files (project-relative).")
+    lines.append("- If the entry file defines helper functions you need (see list below), set 'lift_from_entry' to their names; the tool will insert their definitions verbatim from the entry file before your driver_source.")
+    lines.append("")
+
+    # Vulnerabilities summary (for additional bias)
+    vulns_list = []
+    if isinstance(vulns_data, dict):
+        vulns_list = vulns_data.get("vulnerabilities", []) or []
+    if vulns_list:
+        lines.append("Vulnerabilities summary (from vulnerabilities.json):")
+        for v in vulns_list[:16]:
+            lines.append(
+                f"- {v.get('cve-id')} CWE-{v.get('cwe-id')} {v.get('cwe-name')}: "
+                f"{v.get('affected-function')} in {v.get('affected-file')}"
+            )
+        lines.append("Use these as hints for which APIs and files to prioritize, while keeping the driver single-shot and deterministic.")
+        lines.append("")
+
+    # AFG summary section (compact) + explicit vulnerable API list + entry→vuln call paths
+    if afg:
+        nodes = afg.get("nodes", []) or []
+        edges = afg.get("edges", []) or []
+        dict_tokens = afg.get("dictionary_tokens", []) or []
+        notes = afg.get("notes", "")
+        call_paths = afg.get("call_paths", []) or []
+        api_flow_edges = afg.get("api_flow_edges", []) or []
+
+        # First, show the concrete vulnerable APIs that the driver should target
+        api_nodes = []
+        for n in nodes:
+            kind = n.get("kind") or n.get("type")
+            if kind == "api":
+                api_nodes.append(n)
+        if api_nodes:
+            lines.append("Vulnerable APIs (from AFG; choose at least one of these to call directly in your driver):")
+            for n in api_nodes[:16]:
+                label = n.get("label") or n.get("id") or "(unnamed api)"
+                header = n.get("header")
+                sig = n.get("signature")
+                desc_parts: list[str] = [label]
+                if header:
+                    desc_parts.append(f"header: {header}")
+                if sig:
+                    desc_parts.append(f"signature: {sig}")
+                lines.append("- " + " | ".join(desc_parts))
+            lines.append("")
+
+        # Then, show any simple entry→...→vuln call paths discovered
+        if call_paths:
+            lines.append("Entry-to-vulnerability call paths (from entry functions such as main to vulnerable APIs):")
+            for pth in call_paths[:12]:
+                if not isinstance(pth, list) or len(pth) < 2:
+                    continue
+                lines.append("- " + " -> ".join(str(x) for x in pth))
+            lines.append("Use one of these call chains as a template for your harness: construct the same sequence of logical calls, feeding fuzzer-controlled data at the appropriate step (e.g., query string, body, or buffer) so that the vulnerable API is invoked once per execution.")
+            lines.append("")
+
+        # Optionally, show API-level flows between vulnerable functions and nearby APIs
+        if api_flow_edges:
+            lines.append("API-level data flow between functions (from libclang-based analysis):")
+            for e in api_flow_edges[:24]:
+                src = e.get("src")
+                dst = e.get("dst")
+                reason = e.get("reason") or "type-based flow"
+                if not src or not dst:
+                    continue
+                lines.append(f"- {src} -> {dst} ({reason})")
+            lines.append(
+                "Use these API-flow hints to decide which helper/library functions to call before or after the vulnerable API, "
+                "preserving realistic type flows (e.g., constructing objects that feed into qs_parse or render_internal)."
+            )
+            lines.append("")
+
+        # Finally, a lighter-weight structural summary of the graph
+        lines.append("Abstract Fuzz Graph (AFG) overview:")
+        lines.append(f"Name: {afg.get('name', 'project_afg')}")
+        if notes:
+            lines.append(f"Notes: {notes}")
+        if nodes:
+            preview_nodes = []
+            for n in nodes[:20]:
+                kind = n.get("kind") or n.get("type")
+                label = n.get("label") or n.get("id")
+                preview_nodes.append(f"{kind}:{label}")
+            lines.append("Nodes (subset): " + ", ".join(preview_nodes))
+        if edges:
+            edge_strs = [
+                f"{e.get('src')}->{e.get('dst')}:{e.get('label')}" for e in edges[:24]
+            ]
+            lines.append("Edges (subset): " + "; ".join(edge_strs))
+        if dict_tokens:
+            lines.append("Suggested dictionary tokens (from AFG/vulns): " + ", ".join(dict_tokens[:32]))
+        lines.append("")
+
+    # Entry-defined helper functions available to lift verbatim
+    try:
+        entry_funcs_json = ctx.notes.get("entry_defined_funcs", "")
+        if entry_funcs_json:
+            lines.append("Entry-defined helper functions (available to lift verbatim via 'lift_from_entry'):")
+            lines.append(entry_funcs_json)
+            lines.append("If your driver needs any of the above, list them under 'lift_from_entry' and do NOT duplicate their bodies in driver_source.")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Context: entrypoint (full)
+    lines.append("Entry file (complete):")
+    lines.append(f"// file: {ctx.main_file.path}")
+    lines.append(ctx.main_file.content)
+
+    # Note: in AFG mode we intentionally do NOT include global source summaries
+    # or additional snippets beyond the entry file, so the model focuses on
+    # combining main() with the vulnerability graph.
+
+    # Final instruction
+    lines.append("")
+    lines.append("Now output ONLY the DriverSpec JSON.")
+
+    prompt_dir = out_dir / "context"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = prompt_dir / "prompt.main2fuzz_afg.md"
     prompt_path.write_text("\n".join(lines), encoding="utf-8")
     return prompt_path

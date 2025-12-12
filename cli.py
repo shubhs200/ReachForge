@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 # Support both package execution (python -m reachforge.cli) and script execution (python cli.py)
-from reachforge.prompt_main2fuzz import build_main2fuzz_prompt
+from reachforge.prompt_main2fuzz import build_main2fuzz_prompt, build_afg_prompt
 from reachforge.llm_runner import run_llm_driver_spec, run_llm_seeds_spec
 from reachforge.schema import validate_driver_spec, write_schema_file
 from reachforge.generator import write_driver_from_spec
 from reachforge.compiler import compile_driver
 from reachforge.prompt_seeds import build_seeds_prompt
 from reachforge.seeds_schema import validate_seeds_spec
+from reachforge.afg_builder import build_afg
 
 
 def _choose_src_root(root: Path) -> Path:
@@ -157,41 +158,16 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
     """
     Build seeds prompt (using vulnerabilities.json + DriverSpec), ask LLM for SeedsSpec (10 seeds),
     validate, decode, and write to out/seeds/<app>.
-    Before generating, check for existing poller inputs recursively and use them if available.
+    Poller-provided inputs are intentionally ignored for now; seeds always come from vulnerabilities.json guidance.
     """
-    import shutil, os
 
     app_name = root.name
-    poller_dir = root / "poller"
     seeds_target = (out / "seeds" / app_name).resolve()
     seeds_target.mkdir(parents=True, exist_ok=True)
 
-    collected_inputs = []
-    if poller_dir.exists():
-        ignored_exts = {".py", ".rb", ".sh", ".txt", ".md", ".json", ".yml", ".yaml", ".Dockerfile", ".poller"}
-        for dirpath, _, filenames in os.walk(poller_dir):
-            for f in filenames:
-                fpath = Path(dirpath) / f
-                ext = fpath.suffix.lower()
-                if ext in ignored_exts:
-                    continue
-                try:
-                    if fpath.is_file() and fpath.stat().st_size > 0:
-                        collected_inputs.append(fpath)
-                except Exception:
-                    continue
-
-    if collected_inputs:
-        print(f"[rf2] Found {len(collected_inputs)} poller inputs, using them as seeds.")
-        for inp in collected_inputs:
-            try:
-                shutil.copy(inp, seeds_target / inp.name)
-            except Exception as e:
-                print(f"[rf2] Warning: failed to copy {inp}: {e}")
-        print(f"[rf2] Seeds collected from poller: {seeds_target}")
-        return 0
-
-    # No poller inputs found, proceed with LLM-based generation
+    # NOTE: Poller input reuse is disabled so that the tool always generates fresh seeds from
+    # vulnerabilities.json context. The previous logic that copied inputs from root/poller can be
+    # restored later if we decide to re-enable that behavior.
     prompt = build_seeds_prompt(root, out)
     if not prompt:
         print("[rf2] Seeds: prerequisites missing (no driver/spec or no context). Skipping.")
@@ -440,8 +416,12 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     seeds_api_base = getattr(args, "seeds_api_base", None)
 
     _ensure_dir(out)
-    # 1) Build prompt (source-first, main only + aux snippets)
-    prompt_path = build_main2fuzz_prompt(root, out, include_vulns=getattr(args, "include_vulns", True))
+    # 1) Build prompt (either classic main2fuzz or AFG-augmented, based on flag)
+    if getattr(args, "use_afg", False):
+        afg_path = build_afg(root, out)
+        prompt_path = build_afg_prompt(root, out, afg_path)
+    else:
+        prompt_path = build_main2fuzz_prompt(root, out, include_vulns=getattr(args, "include_vulns", True))
     if not prompt_path:
         print("[rf2] Error: failed to build main2fuzz prompt. Ensure entrypoint with int main exists under app/src or src.")
         return 2
@@ -655,6 +635,7 @@ def make_parser() -> argparse.ArgumentParser:
     pm.add_argument("--seeds-api-base", type=str, required=False, help="API base for SEEDS agent (fallback: env/config)")
     pm.add_argument("--include-vulns", dest="include_vulns", action="store_true", help="Include vulnerabilities.json context in the driver prompt")
     pm.add_argument("--no-include-vulns", dest="include_vulns", action="store_false", help="Do not include vulnerabilities.json context in the driver prompt")
+    pm.add_argument("--use-afg", action="store_true", help="Use AFG information derived from vulnerabilities.json to guide fuzz driver generation")
     # Seed generation flags: enabled by default, can be disabled explicitly
     pm.add_argument("--generate-seeds", dest="generate_seeds", action="store_true", default=True, help="Enable seed generation (default: enabled)")
     pm.add_argument("--no-generate-seeds", dest="generate_seeds", action="store_false", help="Disable seed generation")
