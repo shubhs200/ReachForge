@@ -160,8 +160,15 @@ def _detect_app_name(app_root: str | None, app_name: str | None) -> str:
     if (ar / "redis-test.conf").exists() or (ar / "redis.conf").exists():
         return "redis"
 
-    # image-histogram: ELLF challenge with app/src/image.c
+    # image-histogram / challenge: ELLF image challenge with app/src/image.c
+    # In the CI pipeline, the ELLF challenge layout uses build-artifacts/challenge/...
+    # and historically used the "challenge" APP_RULE (with those paths). For a local
+    # image-histogram repo (no build-artifacts/ tree), we instead use the
+    # "image-histogram" rule that targets build/vcpkg_installed.
     if (ar / "app" / "src" / "image.c").exists():
+        ba = ar / "build-artifacts" / "challenge" / "build" / "vcpkg_installed"
+        if ba.exists():
+            return "challenge"
         return "image-histogram"
 
     # lamartine: vcpkg.json mentioning lamartine, or characteristic doom sources
