@@ -111,7 +111,7 @@ APP_RULES = {
         '-Lbuild-artifacts/challenge/build/vcpkg_installed/x64-linux-cromulence/lib '
         '{src} '
         '-o {binary} '
-        '-llua -lhiredis -lm -ldl -lpthread"'
+        '-lm -ldl -lpthread"'
     )
 }
 
