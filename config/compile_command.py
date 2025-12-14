@@ -106,7 +106,7 @@ APP_RULES = {
     ),
     "redis": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang-fast -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
+        'afl-clang -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
         '-Ibuild/vcpkg_installed/x64-linux-cromulence/include '
         '-Lbuild/vcpkg_installed/x64-linux-cromulence/lib '
         '{src} '
