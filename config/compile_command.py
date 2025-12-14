@@ -104,11 +104,84 @@ APP_RULES = {
         '-o {binary} {src} '
         'cJSON.c cJSON_Utils.c"'
     ),
+    "redis": (
+        'bash -lc "AFL_USE_ASAN=1 '
+        'afl-clang-fast -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
+        '-Ibuild/vcpkg_installed/x64-linux-cromulence/include '
+        '-Lbuild/vcpkg_installed/x64-linux-cromulence/lib '
+        '{src} '
+        '-o {binary} '
+        '-llua -lhiredis -lm -ldl -lpthread"'
+    )
 }
 
 
 def get_compile_cmd(app_root: str, app_name: str) -> str | None:
     return APP_RULES.get(app_name)
+
+
+def _detect_app_name(app_root: str | None, app_name: str | None) -> str:
+    """Best-effort logical app-name detection.
+
+    Priority:
+      1) REACHFORGE_APP_NAME env override
+      2) Marker file in repo (.reachforge_app or reachforge_app_name.txt)
+      3) Heuristics for known apps (redis, image-histogram, lamartine)
+      4) CLI-provided app_name
+      5) Directory basename
+    """
+    from pathlib import Path as _P
+    import os as _os
+    import json as _json
+
+    ar = _P(app_root).resolve() if app_root else _P(".").resolve()
+
+    # 1) Explicit environment override
+    env_name = _os.getenv("REACHFORGE_APP_NAME")
+    if env_name:
+        env_name = env_name.strip()
+        if env_name:
+            return env_name
+
+    # 2) Repository-local marker file
+    for rel in (".reachforge_app", "reachforge_app_name.txt"):
+        marker = ar / rel
+        if marker.exists():
+            try:
+                text = marker.read_text(encoding="utf-8")
+                first = (text.splitlines()[0] if text else "").strip()
+            except Exception:
+                first = ""
+            if first:
+                return first
+
+    # 3) Heuristics for known apps
+    # redis: redis-test.conf (or similar) at repo root
+    if (ar / "redis-test.conf").exists() or (ar / "redis.conf").exists():
+        return "redis"
+
+    # image-histogram: ELLF challenge with app/src/image.c
+    if (ar / "app" / "src" / "image.c").exists():
+        return "image-histogram"
+
+    # lamartine: vcpkg.json mentioning lamartine, or characteristic doom sources
+    vcpkg = ar / "vcpkg.json"
+    if vcpkg.exists():
+        try:
+            cfg = _json.loads(vcpkg.read_text(encoding="utf-8"))
+            name = str(cfg.get("name", "")).lower()
+            if "lamartine" in name:
+                return "lamartine"
+        except Exception:
+            pass
+    if (ar / "src" / "doom" / "pwad.cpp").exists():
+        return "lamartine"
+
+    # 4) Fallbacks
+    if app_name:
+        return app_name
+
+    return ar.name
 
 
 def generate_compile_cmd_template(app_root: str | None = None, app_name: str | None = None) -> str:
@@ -125,12 +198,14 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
                 return t
         return "x64-linux-ellf"
 
-    # analyze-image and challenge handled by APP_RULES
-    if app_name in {"analyze-image", "challenge"}:
-        return get_compile_cmd(app_root or "", app_name)
+    resolved_name = _detect_app_name(app_root, app_name)
 
-    # NEW: dynamic rule for image-histogram
-    if app_name == "image-histogram":
+    # analyze-image and challenge handled by APP_RULES (legacy)
+    if resolved_name in {"analyze-image", "challenge"}:
+        return get_compile_cmd(app_root or "", resolved_name)
+
+    # Dynamic rule for image-histogram
+    if resolved_name == "image-histogram":
         trip = _pick_triplet(ar)
         inc = f"build/vcpkg_installed/{trip}/include"
         lib = f"build/vcpkg_installed/{trip}/lib"
@@ -159,11 +234,11 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
         )
 
     # lamartine handled by APP_RULES
-    if app_name == "lamartine":
-        return get_compile_cmd(app_root or "", app_name)
+    if resolved_name == "lamartine":
+        return get_compile_cmd(app_root or "", resolved_name)
 
-    # fallback
-    cmd = get_compile_cmd(app_root or "", app_name)
+    # fallback: try APP_RULES by resolved_name, then generic
+    cmd = get_compile_cmd(app_root or "", resolved_name)
     if cmd:
         return cmd
 
