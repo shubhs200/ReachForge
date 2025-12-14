@@ -105,13 +105,14 @@ APP_RULES = {
         'cJSON.c cJSON_Utils.c"'
     ),
     "redis": (
-        'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
-        '-Ibuild-artifacts/challenge/build/vcpkg_installed/x64-linux-cromulence/include '
-        '-Lbuild-artifacts/challenge/build/vcpkg_installed/x64-linux-cromulence/lib '
-        '{src} '
-        '-o {binary} '
-        '-lm -ldl -lpthread"'
+    'bash -lc "AFL_USE_ASAN=1 '
+    'afl-clang -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
+    '-I. -Isrc '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include '
+    '{src} '
+    '-o {binary} '
+    '-Lbuild-artifacts/vcpkg_installed/x64-linux-cromulence/lib '
+    '-lm -ldl -lpthread"'
     )
 }
 
