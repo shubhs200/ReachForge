@@ -1,14 +1,14 @@
 {
   "default": {
-    "model": "gpt-5.1",
+    "model": "gpt-5.2",
     "api_base": "https://api.openai.com/v1"
   },
   "driver": {
-    "model": "gpt-5.1",
+    "model": "gpt-5.2",
     "api_base": "https://api.openai.com/v1"
   },
   "seeds": {
-    "model": "gpt-5.1",
+    "model": "gpt-5.2",
     "api_base": "https://api.openai.com/v1"
   }
 }
