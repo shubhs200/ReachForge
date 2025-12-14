@@ -164,7 +164,7 @@ def _persist_driver_spec(spec: dict, path: Path) -> None:
     path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
 
 
-def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: str | None = None, api_base: str | None = None) -> int:
+def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: str | None = None, api_base: str | None = None, max_attempts: int = 3) -> int:
     """
     Build seeds prompt (using vulnerabilities.json + DriverSpec), ask LLM for SeedsSpec (10 seeds),
     validate, decode, and write to out/seeds/<app>.
@@ -182,22 +182,49 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
     if not prompt:
         print("[rf2] Seeds: prerequisites missing (no driver/spec or no context). Skipping.")
         return 0
+
     out_spec = (out / "seeds" / "spec.json").resolve()
     out_spec.parent.mkdir(parents=True, exist_ok=True)
-    ok, msg = run_llm_seeds_spec(prompt, out_spec, llm_cmd=llm_cmd, model=model, api_base=api_base)
-    if not ok:
-        print(f"[rf2] Seeds LLM failed: {msg}")
+
+    last_err = "unknown error"
+    spec: dict | None = None
+    for attempt in range(1, max_attempts + 1):
+        ok, msg = run_llm_seeds_spec(prompt, out_spec, llm_cmd=llm_cmd, model=model, api_base=api_base)
+        if not ok:
+            last_err = f"LLM failed: {msg}"
+            print(f"[rf2] Seeds: LLM failed (attempt {attempt}/{max_attempts}): {msg}")
+            continue
+
+        # Parse SeedsSpec JSON
+        try:
+            spec_text = out_spec.read_text(encoding="utf-8")
+            spec = json.loads(spec_text)
+        except Exception as e:
+            last_err = f"failed to parse JSON: {e}"
+            print(f"[rf2] Seeds: failed to parse JSON (attempt {attempt}/{max_attempts}): {e}")
+            # Leave the raw text around for debugging.
+            continue
+
+        ok_spec, err = validate_seeds_spec(spec)
+        if not ok_spec:
+            last_err = f"validation failed: {err}"
+            print(f"[rf2] Seeds: validation failed (attempt {attempt}/{max_attempts}): {err}")
+            # Keep the invalid candidate for inspection.
+            try:
+                (out / "seeds" / f"spec.invalid.attempt{attempt}.json").write_text(
+                    json.dumps(spec, indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
+            continue
+
+        # If we reach here, we have a valid spec; break the retry loop.
+        break
+    else:
+        # Exhausted attempts
+        print(f"[rf2] Seeds: giving up after {max_attempts} attempts; last error: {last_err}")
         return 3
-    # Validate seeds spec
-    try:
-        spec = json.loads(out_spec.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[rf2] Seeds: failed to parse JSON: {e}")
-        return 3
-    ok, err = validate_seeds_spec(spec)
-    if not ok:
-        print(f"[rf2] Seeds: validation failed: {err}")
-        return 3
+
     # Write seed files
     ok, wmsg, target = _write_seeds_files(spec, out, app_name)
     if not ok:
@@ -551,7 +578,15 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
 
     # 6) Seeds generation (default: enabled; disable with --no-generate-seeds)
     if getattr(args, "generate_seeds", True):
-        rc = _maybe_generate_seeds(root, out, llm_cmd=seeds_llm_cmd, model=seeds_model, api_base=seeds_api_base)
+        seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
+        rc = _maybe_generate_seeds(
+            root,
+            out,
+            llm_cmd=seeds_llm_cmd,
+            model=seeds_model,
+            api_base=seeds_api_base,
+            max_attempts=seeds_max_attempts,
+        )
         if rc != 0:
             return rc
 
@@ -656,7 +691,8 @@ def make_parser() -> argparse.ArgumentParser:
     # Seed generation flags: enabled by default, can be disabled explicitly
     pm.add_argument("--generate-seeds", dest="generate_seeds", action="store_true", default=True, help="Enable seed generation (default: enabled)")
     pm.add_argument("--no-generate-seeds", dest="generate_seeds", action="store_false", help="Disable seed generation")
-    pm.add_argument("--max-attempts", type=int, required=False, default=2, help="Max retry attempts to auto-fix compile errors inline")
+    pm.add_argument("--seeds-max-attempts", type=int, required=False, default=3, help="Max retry attempts to regenerate SeedsSpec on validation failure (default: 3)")
+    pm.add_argument("--max-attempts", type=int, required=False, default=10, help="Max retry attempts to auto-fix compile errors inline")
     # Fuzzing stage controls
     pm.add_argument("--run-fuzz", dest="run_fuzz", action="store_true", default=True, help="Run AFL++ fuzzing after seeds (default: enabled)")
     pm.add_argument("--no-run-fuzz", dest="run_fuzz", action="store_false", help="Disable fuzzing stage")
