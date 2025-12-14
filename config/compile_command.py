@@ -112,7 +112,7 @@ APP_RULES = {
     '{src} '
     '-o {binary} '
     '-Lbuild-artifacts/vcpkg_installed/x64-linux-cromulence/lib '
-    '-lm -ldl -lpthread"'
+    '-llua -lm -ldl -lpthread"'
     )
 }
 
