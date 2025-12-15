@@ -109,20 +109,44 @@ def _iter_dep_include_roots(root: Path) -> List[Path]:
 
 
 def _find_header_for_file(root: Path, file_basename: str) -> Optional[Path]:
-    """Locate a header by basename under known dependency include roots.
+    """Locate a plausible header for a vulnerable source file.
+
+    We search both dependency include roots and project sources, and we are
+    forgiving about the exact basename: if the vulnerability is reported in
+    foo.c, we will also look for foo.h / foo.hpp.
 
     Returns the first matching path, or None if not found.
     """
     if not file_basename:
         return None
-    for inc_root in _iter_dep_include_roots(root):
+
+    base_path = Path(file_basename)
+    stem = base_path.stem
+    suffix = base_path.suffix.lower()
+
+    candidate_names = {file_basename}
+    # If the vuln is reported in a .c/.cc/.cpp file, also look for headers
+    if suffix in {".c", ".cc", ".cpp", ".cxx"}:
+        candidate_names.add(f"{stem}.h")
+        candidate_names.add(f"{stem}.hpp")
+
+    # Search roots: dependency include dirs first, then project sources
+    search_roots: List[Path] = []
+    search_roots.extend(_iter_dep_include_roots(root))
+    for cand in [root / "app" / "src", root / "src", root]:
+        if cand.is_dir() and cand not in search_roots:
+            search_roots.append(cand)
+
+    for inc_root in search_roots:
         try:
-            for p in inc_root.rglob(file_basename):
-                if p.is_file():
-                    return p
+            for name in candidate_names:
+                for p in inc_root.rglob(name):
+                    if p.is_file():
+                        return p
         except Exception:
             continue
     return None
+
 
 
 def _extract_signature_preview(header_text: str, func: str, max_len: int = 160) -> Optional[str]:
@@ -296,6 +320,72 @@ def _find_call_paths(
                 visited[nxt] = depth + 1
                 queue.append((nxt, path + [nxt]))
     return paths
+
+
+# -------------------- Simple callgraph-based API-flow extraction (fallback) --------------------
+
+
+def _build_simple_api_flow_edges(adj: Dict[str, List[str]], vulns: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Build a lightweight API-flow edge set around vulnerable functions using
+    the naive callgraph only.
+
+    For each vulnerable function name F, we add:
+      - caller -> F edges for any caller that directly invokes F
+      - F -> callee edges for any function F directly calls
+
+    This is generic and does not depend on libclang. It serves as a fallback
+    or complement to the richer, type-based edges built with libclang.
+    """
+    # Collect vulnerable function names
+    vuln_names: List[str] = []
+    for v in vulns:
+        f = _extract_vuln_fields(v)
+        if f["func"]:
+            vuln_names.append(str(f["func"]))
+
+    if not vuln_names or not adj:
+        return []
+
+    from collections import defaultdict
+
+    # Build reverse callgraph: callee -> [callers]
+    rev_adj: Dict[str, List[str]] = defaultdict(list)
+    for caller, callees in adj.items():
+        for callee in callees:
+            rev_adj[callee].append(caller)
+
+    edges: List[Dict[str, str]] = []
+    for func in vuln_names:
+        # callers of the vulnerable function
+        for caller in rev_adj.get(func, []):
+            edges.append(
+                {
+                    "src": caller,
+                    "dst": func,
+                    "reason": "callgraph: caller invokes vulnerable function",
+                }
+            )
+        # callees from the vulnerable function
+        for callee in adj.get(func, []):
+            edges.append(
+                {
+                    "src": func,
+                    "dst": callee,
+                    "reason": "callgraph: vulnerable function invokes callee",
+                }
+            )
+
+    # Deduplicate and trim
+    seen: set[Tuple[str, str]] = set()
+    uniq: List[Dict[str, str]] = []
+    for e in edges:
+        key = (e["src"], e["dst"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(e)
+
+    return uniq[:64]
 
 
 # -------------------- Optional libclang-based API-flow extraction --------------------
@@ -628,8 +718,26 @@ def build_afg(root: Path, out: Path) -> Path:
         seen.add(t)
         uniq_tokens.append(t)
 
-    # Optional: libclang-based API-flow edges near vulnerable functions
-    api_flow_edges = _build_api_flow_edges_with_clang(root, vulns)
+    # API-flow edges near vulnerable functions.
+    # First use simple callgraph-based edges as a cheap, always-available
+    # approximation, then optionally enrich with libclang-based type flows.
+    simple_flow_edges = _build_simple_api_flow_edges(adj, vulns)
+    clang_flow_edges = _build_api_flow_edges_with_clang(root, vulns)
+
+    # Merge while deduplicating src/dst pairs, keeping the set compact.
+    api_flow_edges: List[Dict[str, str]] = []
+    seen_pairs: set[Tuple[str, str]] = set()
+    for e in simple_flow_edges + clang_flow_edges:
+        src = e.get("src")
+        dst = e.get("dst")
+        if not src or not dst:
+            continue
+        key = (src, dst)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        api_flow_edges.append(e)
+    api_flow_edges = api_flow_edges[:64]
 
     afg = AFG(
         name="project_afg",
@@ -641,7 +749,9 @@ def build_afg(root: Path, out: Path) -> Path:
         notes=(
             "AFG derived from vulnerabilities.json; nodes focus on vulnerable APIs "
             "and are enriched with header/signature, simple entry->vuln call paths "
-            "when available, and optional libclang-based API-flow edges around vulnerable functions."
+            "when available, and API-flow edges around vulnerable functions built "
+            "from a combination of naive callgraph analysis and optional libclang "
+            "type-based flows."
         ),
     )
 
