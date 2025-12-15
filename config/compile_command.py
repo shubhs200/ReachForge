@@ -115,11 +115,16 @@ APP_RULES = {
     'bash -lc "AFL_USE_ASAN=1 '
     'afl-clang -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
     '-I. -Isrc '
+    '-Ideps/fast_float '
+    '-Ideps/fpconv '
+    '-Ideps/linenoise '
     '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include/hdr '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include/hiredis '
     '{src} '
     '-o {binary} '
     '-Lbuild-artifacts/vcpkg_installed/x64-linux-cromulence/lib '
-    '-lm -ldl -lpthread"'
+    '-llua -lm -ldl -lpthread"'
     )
 }
 
