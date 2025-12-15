@@ -100,8 +100,12 @@ def find_entry_main_and_context(root: Path, *, aux_files_cap: int = 8, aux_clip_
     main_file: Optional[Path] = None
     main_text: Optional[str] = None
 
-    # Scan all source files for the first file that defines int main()
+    # Scan all source files for the first file that defines int main().
+    # Explicitly skip cli.cpp so that pre-existing CLI harnesses are not
+    # treated as the application entrypoint.
     for p in files:
+        if p.name == "cli.cpp":
+            continue
         txt = _read_text(p)
         # Debug: print which file is being checked and if main is found
         # print(f"Checking {p}: {'FOUND main' if _has_main(txt) else 'no main'}")

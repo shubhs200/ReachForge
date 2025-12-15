@@ -79,22 +79,29 @@ APP_RULES = {
 
     # lamartine
     "lamartine": (
-        'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
-        'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -fuse-ld=lld '
-        '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
-        '-I. -Isrc '
-        '-I build/vcpkg_installed/x64-linux-cromulence/include '
-        '-I build/vcpkg_installed/x64-linux-cromulence/include/libxml2 '
-        '-o {binary} {src} '
-        'src/assert.cpp src/base64.cpp src/error_processor.cpp src/session.cpp src/share_finder.cpp '
-        'src/util_env.cpp src/util_rand.cpp src/var_finder.cpp src/watcher.cpp '
-        'src/doom/map.cpp src/doom/pwad.cpp src/doom/svg_writer.cpp src/doom/udmf_parser.cpp '
-        'src/tpl/base.cpp src/tpl/index.cpp src/tpl/map.cpp src/tpl/upload.cpp '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libsodium.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libxml2.a '
-        'build/vcpkg_installed/x64-linux-cromulence/lib/libz.a '
-        '-ldl -lm"'
+    'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
+    'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined '
+    '-fno-omit-frame-pointer -fuse-ld=lld '
+    '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
+    '-I. -Isrc -Isrc/doom -Isrc/tpl '
+    '-I build/vcpkg_installed/x64-linux-cromulence/include '
+    '-I build/vcpkg_installed/x64-linux-cromulence/include/libxml2 '
+    '-o {binary} {src} '
+    'src/assert.cpp src/base64.cpp src/error_processor.cpp src/session.cpp src/share_finder.cpp '
+    'src/util_env.cpp src/util_rand.cpp src/var_finder.cpp src/watcher.cpp '
+    'src/doom/classic_reader.cpp src/doom/digger.cpp '
+    'src/doom/map.cpp src/doom/pwad.cpp src/doom/svg_writer.cpp src/doom/udmf_parser.cpp '
+    'src/tpl/base.cpp src/tpl/index.cpp src/tpl/map.cpp src/tpl/upload.cpp '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libsodium.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libxml2.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libmagic.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libzip.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libz.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libbz2.a '
+    'build/vcpkg_installed/x64-linux-cromulence/lib/libcrypto.a '
+    '-ldl -lm"'
     ),
+
 
     # cjson
     "cjson": (

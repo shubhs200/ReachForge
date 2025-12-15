@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -125,6 +126,65 @@ def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _find_cli_harness(root: Path) -> Optional[Path]:
+    """Best-effort detection of a CLI harness source file named cli.cpp.
+
+    We check a few common locations under the project root and, if those
+    fail, fall back to a unique cli.cpp anywhere under the tree.
+    """
+    root = root.resolve()
+    # Preferred locations
+    candidates = [
+        root / "cli.cpp",
+        root / "src" / "cli.cpp",
+        root / "app" / "src" / "cli.cpp",
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+
+    # Fallback: unique cli.cpp somewhere under the root
+    try:
+        found = [p for p in root.rglob("cli.cpp") if p.is_file()]
+    except Exception:
+        found = []
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def _collect_cli_seeds_from_poller(root: Path, out: Path) -> int:
+    """Copy sample inputs from <root>/poller/ into <out>/seeds_cli/.
+
+    We treat non-Python files under poller/ as seed candidates so that a
+    manually maintained CLI harness (cli.cpp) can be fuzzed using the same
+    inputs the poller already exercises.
+    Returns the number of seed files copied.
+    """
+    poller_dir = (root / "poller").resolve()
+    seeds_dir = (out / "seeds_cli").resolve()
+    seeds_dir.mkdir(parents=True, exist_ok=True)
+
+    if not poller_dir.exists() or not poller_dir.is_dir():
+        return 0
+
+    count = 0
+    for p in sorted(poller_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        name_low = p.name.lower()
+        # Skip poller script and Python artifacts; copy everything else
+        if name_low in ("poller.py",) or name_low.endswith((".py", ".pyc", ".pyo")):
+            continue
+        dest = seeds_dir / p.name
+        try:
+            shutil.copy2(p, dest)
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
 def _write_seeds_files(spec: dict, out_dir: Path, app_name: str) -> tuple[bool, str, Path]:
     """
     Decode and write seed files under <out_dir>/seeds/<app_name>/.
@@ -234,24 +294,44 @@ def _maybe_generate_seeds(root: Path, out: Path, *, llm_cmd: str | None, model: 
     return 0
 
 
-def _build_driver_fix_prompt(root: Path, out: Path, app_name: str, *, spec_path: Path, src_path: Path) -> Path:
-    """
-    Construct a compile-fix prompt that includes:
+def _build_driver_fix_prompt(
+    root: Path,
+    out: Path,
+    app_name: str,
+    *,
+    spec_path: Path,
+    src_path: Path,
+    original_prompt: Path | None = None,
+) -> Path:
+    """Construct a compile-fix prompt.
+
+    The prompt always includes:
       - The last DriverSpec JSON
       - The current driver source
       - The compile errors (compile.log.txt)
+
+    If *original_prompt* is provided (the main2fuzz/AFG prompt used for the
+    initial DriverSpec), it is included as read-only context so that the
+    model preserves the same high-level subsystem/protocol/API focus instead
+    of drifting to an unrelated driver design.
     """
     out = out.resolve()
     lines: list[str] = []
-    lines.append("You are given a DriverSpec JSON, the resulting driver source, and compile errors.")
-    lines.append("Task: Output ONLY a corrected DriverSpec JSON (no code fences, no prose) that fixes compilation while preserving the single-shot, deterministic driver behavior.")
+    lines.append("You are given a DriverSpec JSON, the resulting driver source, compile errors, and (optionally) the original driver-generation prompt.")
+    lines.append("Task: Output ONLY a corrected DriverSpec JSON (no code fences, no prose) that fixes compilation while:")
+    lines.append("- Preserving the single-shot, deterministic driver behavior; and")
+    lines.append("- Preserving the same high-level target: the same application subsystem / protocol / library and the same vulnerable or high-risk APIs/functions that the previous DriverSpec was exercising.")
+    lines.append("")
     lines.append("Constraints:")
+    lines.append("- Do NOT redesign the driver around a different subsystem or input format just to make it compile.")
     lines.append("- Keep the language field unchanged (c or c++).")
     lines.append("- Keep the single-shot design: read stdin once; no servers/event loops/threads/sockets/sleeps/RNG/time usage.")
-    lines.append("- Use minimal, safe fixes: adjust includes, correct function signatures, minimal state init/cleanup.")
-    lines.append("- Do NOT depend on build system changes. You may only change fields inside the DriverSpec (includes, driver_source, defines/flags if strictly necessary).")
+    lines.append("- Use minimal, safe fixes: adjust includes, correct function signatures, minimal state init/cleanup, tweak extra_sources/flags only as needed.")
+    lines.append("- Do NOT depend on build system changes. You may only change fields inside the DriverSpec (includes, driver_source, defines/flags, extra_sources, lift_from_entry as strictly necessary).")
     lines.append("- Output must be a single JSON object conforming to the DriverSpec schema. No extra text.")
     lines.append("")
+
+    # Previous DriverSpec and driver source
     try:
         spec_text = spec_path.read_text(encoding="utf-8")
     except Exception:
@@ -265,6 +345,7 @@ def _build_driver_fix_prompt(root: Path, out: Path, app_name: str, *, spec_path:
         comp_text = comp_log.read_text(encoding="utf-8")
     except Exception:
         comp_text = ""
+
     lines.append("Previous DriverSpec JSON (verbatim):")
     lines.append(spec_text)
     lines.append("")
@@ -274,6 +355,27 @@ def _build_driver_fix_prompt(root: Path, out: Path, app_name: str, *, spec_path:
     lines.append("Compile errors (verbatim):")
     lines.append(comp_text)
     lines.append("")
+
+    # Optional: original main2fuzz/AFG prompt for additional context
+    orig_prompt_text = ""
+    if original_prompt is not None:
+        try:
+            orig_prompt_text = original_prompt.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            orig_prompt_text = ""
+    if orig_prompt_text:
+        lines.append("Original driver-generation prompt (context only, do NOT re-emit):")
+        lines.append("""\
+Use the following original prompt only as background context. You MUST:
+- Keep targeting the same application subsystem / protocol / library.
+- Keep focusing on the same vulnerable or high-risk APIs/call paths it
+  described (for example, the same functions, files, or AFG nodes).
+- NOT switch to an unrelated parser or subsystem just to satisfy the
+  compiler. Make minimal changes that keep the original intent.
+""")
+        lines.append(orig_prompt_text)
+        lines.append("")
+
     lines.append("Now output ONLY the corrected DriverSpec JSON.")
     prompt_path = out / "context" / "prompt.driver_fix.inline.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +555,37 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     seeds_api_base = getattr(args, "seeds_api_base", None)
 
     _ensure_dir(out)
+
+    # 0) If using AFG, optionally compile existing cli.cpp harness and seeds_cli first
+    if getattr(args, "use_afg", False):
+        cli_src = _find_cli_harness(root)
+        if cli_src is not None:
+            driver_dir = out / "drivers" / root.name
+            driver_dir.mkdir(parents=True, exist_ok=True)
+            cli_dst = driver_dir / "cli.cpp"
+            try:
+                shutil.copy2(cli_src, cli_dst)
+                print(f"[rf2] CLI harness copied to driver dir: {cli_dst}")
+            except Exception as e:
+                print(f"[rf2] Warning: failed to copy cli.cpp into driver dir: {e}; skipping CLI harness compile.")
+            else:
+                cli_binary = driver_dir / "fuzz_driver_cli"
+                ok_cli, msg_cli = compile_driver(
+                    app_root=root,
+                    app_name=root.name,
+                    src_path=cli_dst,
+                    binary_path=cli_binary,
+                    out_dir=out,
+                    workdir=workdir,
+                    extra_sources=None,
+                )
+                print(f"[rf2] CLI harness compile: {msg_cli}")
+                if ok_cli:
+                    n_cli_seeds = _collect_cli_seeds_from_poller(root, out)
+                    print(f"[rf2] CLI seeds from poller: {n_cli_seeds} files -> {out / 'seeds_cli'}")
+                else:
+                    print("[rf2] Warning: CLI harness compile failed; continuing with main driver only.")
+
     # 1) Build prompt (either classic main2fuzz or AFG-augmented, based on flag)
     if getattr(args, "use_afg", False):
         afg_path = build_afg(root, out)
@@ -539,7 +672,14 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
             last_src = src_path
             for attempt in range(1, max_attempts + 1):
                 print(f"[rf2] Retry attempt {attempt}/{max_attempts} ...")
-                prompt_fix = _build_driver_fix_prompt(root, out, app_name, spec_path=out / "specs" / "driver_spec.json", src_path=last_src)
+                prompt_fix = _build_driver_fix_prompt(
+                    root,
+                    out,
+                    app_name,
+                    spec_path=out / "specs" / "driver_spec.json",
+                    src_path=last_src,
+                    original_prompt=prompt_path,
+                )
                 retry_spec_path = out / "specs" / f"driver_spec.retry{attempt}.json"
                 ok_llm, msg_llm = run_llm_driver_spec(prompt_fix, retry_spec_path, llm_cmd=driver_llm_cmd, model=driver_model, api_base=driver_api_base)
                 if not ok_llm:
