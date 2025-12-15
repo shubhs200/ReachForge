@@ -324,6 +324,7 @@ def _build_driver_fix_prompt(
     lines.append("")
     lines.append("Constraints:")
     lines.append("- Do NOT redesign the driver around a different subsystem or input format just to make it compile.")
+    lines.append("- Do NOT change the intended functionality or semantics of the driver, or which logical APIs it exercises, beyond what is strictly required to satisfy the compiler.")
     lines.append("- Keep the language field unchanged (c or c++).")
     lines.append("- Keep the single-shot design: read stdin once; no servers/event loops/threads/sockets/sleeps/RNG/time usage.")
     lines.append("- Use minimal, safe fixes: adjust includes, correct function signatures, minimal state init/cleanup, tweak extra_sources/flags only as needed.")
