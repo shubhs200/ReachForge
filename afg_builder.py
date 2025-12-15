@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -89,22 +90,39 @@ def _extract_vuln_fields(v: Dict[str, Any]) -> Dict[str, Optional[str]]:
 # -------------------- Dependency include + signature enrichment --------------------
 
 def _iter_dep_include_roots(root: Path) -> List[Path]:
-    """Return possible dependency include roots under build/vcpkg_installed.
+    """Return possible dependency include roots.
 
-    This is intentionally generic: if build/vcpkg_installed/<triplet>/include
-    exists, we treat those include dirs as search roots for vulnerable headers.
+    By default we treat build/vcpkg_installed/<triplet>/include as search roots
+    for vulnerable headers. Additionally, callers can provide extra include
+    roots via the REACHFORGE_EXTRA_INCLUDE_ROOTS environment variable (a
+    PATH-style, os.pathsep-separated list of absolute directories).
     """
     roots: List[Path] = []
+
+    # Project-local vcpkg installation (e.g., build/vcpkg_installed/x64-*/include)
     vcpkg_root = root / "build" / "vcpkg_installed"
-    if not vcpkg_root.exists():
-        return roots
-    try:
-        for sub in vcpkg_root.iterdir():
-            inc = sub / "include"
-            if inc.is_dir():
-                roots.append(inc)
-    except Exception:
-        pass
+    if vcpkg_root.exists():
+        try:
+            for sub in vcpkg_root.iterdir():
+                inc = sub / "include"
+                if inc.is_dir():
+                    roots.append(inc)
+        except Exception:
+            pass
+
+    # Optional extra include roots supplied by the environment so that
+    # pipelines with non-standard vcpkg layouts can still expose their
+    # dependency headers to the AFG builder.
+    extra = os.environ.get("REACHFORGE_EXTRA_INCLUDE_ROOTS", "")
+    if extra:
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if not part:
+                continue
+            p = Path(part)
+            if p.is_dir() and p not in roots:
+                roots.append(p)
+
     return roots
 
 
