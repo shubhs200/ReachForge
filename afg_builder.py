@@ -148,6 +148,44 @@ def _find_header_for_file(root: Path, file_basename: str) -> Optional[Path]:
     return None
 
 
+def _find_header_for_function(root: Path, func: str) -> Optional[Path]:
+    """Fallback: search dependency and project headers for a declaration of *func*.
+
+    This is more expensive than _find_header_for_file because it scans header
+    contents, but it is still generic and useful for cases like Lua where the
+    vulnerable implementation file (e.g., lbaselib.c) does not have a matching
+    header name, but the public API lives in lua.h / lauxlib.h under
+    build/vcpkg_installed/<triplet>/include.
+    """
+    if not func:
+        return None
+
+    # Candidate header roots: dependency includes + project sources
+    search_roots: List[Path] = []
+    search_roots.extend(_iter_dep_include_roots(root))
+    for cand in [root / "app" / "src", root / "src", root]:
+        if cand.is_dir() and cand not in search_roots:
+            search_roots.append(cand)
+
+    exts = {".h", ".hpp", ".hh"}
+    pattern = re.compile(rf"\b{re.escape(func)}\s*\(")
+
+    for base in search_roots:
+        try:
+            for p in base.rglob("*"):
+                if not p.is_file() or p.suffix.lower() not in exts:
+                    continue
+                try:
+                    txt = p.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if pattern.search(txt):
+                    return p
+        except Exception:
+            continue
+    return None
+
+
 
 def _extract_signature_preview(header_text: str, func: str, max_len: int = 160) -> Optional[str]:
     """Extract a one-line signature-like preview for a function name from header text.
@@ -614,22 +652,29 @@ def build_afg(root: Path, out: Path) -> Path:
         cwe_name = f["cwe_name"]
         pkg = f["package"]
 
-        # Try to locate the header in dependency include paths
+        # Try to locate a suitable header for this vulnerable function.
+        # First, look for a header that corresponds to the reported source
+        # file (e.g., lbaselib.c -> lbaselib.h). If that fails, fall back to
+        # scanning dependency and project headers for a declaration of the
+        # function name itself (useful for cases like Lua where the public
+        # API lives in lua.h / lauxlib.h under build/vcpkg_installed/*/include).
         header_path: Optional[Path] = None
         header_rel: Optional[str] = None
         signature_preview: Optional[str] = None
         if file:
             header_path = _find_header_for_file(root, Path(file).name)
-            if header_path is not None:
-                try:
-                    header_text = header_path.read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    header_text = ""
-                signature_preview = _extract_signature_preview(header_text, func)
-                try:
-                    header_rel = str(header_path.relative_to(root))
-                except Exception:
-                    header_rel = str(header_path)
+        if header_path is None and func:
+            header_path = _find_header_for_function(root, func)
+        if header_path is not None:
+            try:
+                header_text = header_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                header_text = ""
+            signature_preview = _extract_signature_preview(header_text, func)
+            try:
+                header_rel = str(header_path.relative_to(root))
+            except Exception:
+                header_rel = str(header_path)
 
         api_id = f"api_{func}"
         sink_id = f"sink_{func}"
