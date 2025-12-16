@@ -83,7 +83,7 @@ APP_RULES = {
     'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined '
     '-fno-omit-frame-pointer -fuse-ld=lld '
     '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
-    '-I. -Ivariants-builds/0.1.0/src -Ivariants-builds/0.1.0/src/doom -Ivariants-builds/0.1.0/src/tpl '
+    '-I. -Ivariant-builds/0.1.0/src -Ivariant-builds/0.1.0/src/doom -Ivariant-builds/0.1.0/src/tpl '
     '-I build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include '
     '-I build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include/libxml2 '
     '-o {binary} {src} '
