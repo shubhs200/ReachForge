@@ -32,7 +32,15 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
 
     vulns_blob = ""
     if include_vulns:
-        for vp in [root / "vulnerabilities.json", root / "app" / "vulnerabilities.json"]:
+        # Search for vulnerabilities.json starting at root and walking up parents,
+        # supporting layouts where the app root is a subdir (e.g., variant-builds/0.1.0)
+        candidates = []
+        cur = root
+        for cur in [cur, *cur.parents]:
+            candidates.append(cur / "vulnerabilities.json")
+            candidates.append(cur / "app" / "vulnerabilities.json")
+
+        for vp in candidates:
             if vp.exists():
                 try:
                     data = json.loads(vp.read_text(encoding="utf-8"))
@@ -174,7 +182,14 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
 
     # Optional vulnerabilities summary (for labeling AFG nodes)
     vulns_data: dict[str, object] | list[object] | None = None
-    for vp in [root / "vulnerabilities.json", root / "app" / "vulnerabilities.json"]:
+    # Search for vulnerabilities.json starting at root and walking up parents.
+    candidates = []
+    cur = root
+    for cur in [cur, *cur.parents]:
+        candidates.append(cur / "vulnerabilities.json")
+        candidates.append(cur / "app" / "vulnerabilities.json")
+
+    for vp in candidates:
         if vp.exists():
             try:
                 vulns_data = json.loads(vp.read_text(encoding="utf-8"))

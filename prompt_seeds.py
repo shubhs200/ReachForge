@@ -9,7 +9,15 @@ from reachforge.poller_index import build_poller_summary
 
 
 def _load_vulns(root: Path) -> list[dict]:
-    for p in [root / "vulnerabilities.json", root / "app" / "vulnerabilities.json"]:
+    # Search for vulnerabilities.json starting at root and walking up parents,
+    # supporting layouts where the app root is a subdir of the repo.
+    candidates = []
+    cur = root
+    for cur in [cur, *cur.parents]:
+        candidates.append(cur / "vulnerabilities.json")
+        candidates.append(cur / "app" / "vulnerabilities.json")
+
+    for p in candidates:
         if p.exists():
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))

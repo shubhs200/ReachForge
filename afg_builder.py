@@ -48,7 +48,17 @@ def _load_vulnerabilities(root: Path) -> Dict[str, Any]:
 
     Returns a dict with a top-level "vulnerabilities" list, or {} on failure.
     """
-    for candidate in [root / "vulnerabilities.json", root / "app" / "vulnerabilities.json"]:
+    # Search for vulnerabilities.json starting at root and walking up parents.
+    # This allows layouts where the app root is a subdirectory (e.g., variant-builds/0.1.0)
+    # but vulnerabilities.json lives at the repository root.
+    candidates = []
+    cur = root
+    # Walk up from root to filesystem root, checking both cur/ and cur/app/
+    for cur in [cur, *cur.parents]:
+        candidates.append(cur / "vulnerabilities.json")
+        candidates.append(cur / "app" / "vulnerabilities.json")
+
+    for candidate in candidates:
         if candidate.exists():
             try:
                 return json.loads(candidate.read_text(encoding="utf-8"))
