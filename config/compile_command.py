@@ -77,14 +77,12 @@ APP_RULES = {
         '-lstdc++ -lm -ldl -lpthread"'
     ),
 
-    # lamartine
-    "lamartine": (
+"lamartine": (
     'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
     'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined '
     '-fno-omit-frame-pointer -fuse-ld=lld '
     '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
     '-I. -Isrc -Isrc/doom -Isrc/tpl '
-    # includes: vcpkg headers from copied build artifacts
     '-I ../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include '
     '-I ../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include/libxml2 '
     '-o {binary} {src} '
@@ -93,13 +91,13 @@ APP_RULES = {
     'src/doom/classic_reader.cpp src/doom/digger.cpp '
     'src/doom/map.cpp src/doom/pwad.cpp src/doom/svg_writer.cpp src/doom/udmf_parser.cpp '
     'src/tpl/base.cpp src/tpl/index.cpp src/tpl/map.cpp src/tpl/upload.cpp '
-    '../build-artifacts/challenge/libsodium.a '
-    '../build-artifacts/challenge/libxml2.a '
-    '../build-artifacts/challenge/libmagic.a '
-    '../build-artifacts/challenge/libzip.a '
-    '../build-artifacts/challenge/libz.a '
-    '../build-artifacts/challenge/libbz2.a '
-    '../build-artifacts/challenge/libcrypto.a '
+    '../build-artifacts/libsodium.a '
+    '../build-artifacts/libxml2.a '
+    '../build-artifacts/libmagic.a '
+    '../build-artifacts/libzip.a '
+    '../build-artifacts/libz.a '
+    '../build-artifacts/libbz2.a '
+    '../build-artifacts/libcrypto.a '
     '-ldl -lm"'
     ),
 
