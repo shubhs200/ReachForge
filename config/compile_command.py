@@ -84,6 +84,7 @@ APP_RULES = {
     '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
     '-I. -Isrc -Isrc/doom -Isrc/tpl '
     '-I ../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include '
+    '-I ../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include/crow '
     '-I ../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include/libxml2 '
     '-o {binary} {src} '
     'src/assert.cpp src/base64.cpp src/error_processor.cpp src/session.cpp src/share_finder.cpp '
