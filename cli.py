@@ -17,6 +17,9 @@ from reachforge.seeds_schema import validate_seeds_spec
 from reachforge.afg_builder import build_afg
 
 
+FALLBACK_DRIVER_EXTS = {".c", ".cc", ".cpp"}
+
+
 def _choose_src_root(root: Path) -> Path:
     app_src = root / "app" / "src"
     return app_src if app_src.exists() else (root / "src" if (root / "src").exists() else root)
@@ -544,6 +547,119 @@ def _run_afl_fuzz(binary: Path, seeds_dir: Path, afl_out: Path, *, hours: int = 
     return ok, f"afl-fuzz finished (rc={rc}); log: {log}"
 
 
+def _find_bundled_driver() -> Optional[Path]:
+    """Locate a bundled fallback driver under reachforge/drivers/.
+
+    Preference order:
+      - Any file named fuzz_driver.* with a known C/C++ extension.
+      - Otherwise, any C/C++ file under the drivers directory.
+      - If multiple candidates exist, return the lexicographically first path
+        for determinism.
+    """
+    here = Path(__file__).parent
+    drv_dir = here / "drivers"
+    if not drv_dir.exists() or not drv_dir.is_dir():
+        return None
+
+    candidates: list[Path] = []
+    for p in sorted(drv_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in FALLBACK_DRIVER_EXTS:
+            candidates.append(p)
+    if not candidates:
+        return None
+
+    for p in candidates:
+        if p.name.startswith("fuzz_driver"):
+            return p
+    return candidates[0]
+
+
+def _run_fallback_driver_pipeline(
+    root: Path,
+    out: Path,
+    workdir: Path,
+    *,
+    seeds_llm_cmd: str | None,
+    seeds_model: str | None,
+    seeds_api_base: str | None,
+    generate_seeds: bool,
+    seeds_max_attempts: int,
+) -> int:
+    """Fallback used when we cannot build a source-based prompt.
+
+    Uses a bundled driver under reachforge/drivers/, compiles it for the target
+    app, and optionally generates seeds using vulnerabilities.json guidance
+    together with the driver source embedded in a synthetic DriverSpec.
+    """
+    app_name = root.name
+    src_template = _find_bundled_driver()
+    if src_template is None:
+        print("[rf2] Error: no bundled fallback driver found under reachforge/drivers/.")
+        return 2
+
+    driver_dir = out / "drivers" / app_name
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    driver_src = driver_dir / src_template.name
+    try:
+        shutil.copy2(src_template, driver_src)
+        print(f"[rf2] Fallback driver copied to: {driver_src}")
+    except Exception as e:
+        print(f"[rf2] Error: failed to copy fallback driver: {e}")
+        return 2
+
+    # Compile fallback driver
+    binary_path = driver_dir / driver_src.stem
+    ok, cmsg = compile_driver(
+        app_root=root,
+        app_name=app_name,
+        src_path=driver_src,
+        binary_path=binary_path,
+        out_dir=out,
+        workdir=workdir,
+        extra_sources=None,
+    )
+    print(f"[rf2] Fallback compile: {cmsg}")
+    if not ok:
+        return 4
+
+    # Create a minimal DriverSpec so the seeds pipeline can run
+    try:
+        driver_source_text = driver_src.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        driver_source_text = ""
+
+    spec = {
+        "driver_filename": driver_src.name,
+        "language": "c" if driver_src.suffix.lower() == ".c" else "c++",
+        "includes": [],
+        "driver_source": driver_source_text,
+        "required_link_libs": [],
+    }
+    ok_spec, err = validate_driver_spec(spec)
+    if not ok_spec:
+        print(f"[rf2] Warning: synthetic DriverSpec for fallback driver failed validation: {err}")
+
+    specs_dir = out / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    (specs_dir / "driver_spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+    if generate_seeds:
+        rc = _maybe_generate_seeds(
+            root,
+            out,
+            llm_cmd=seeds_llm_cmd,
+            model=seeds_model,
+            api_base=seeds_api_base,
+            max_attempts=seeds_max_attempts,
+        )
+        if rc != 0:
+            return rc
+
+    # For fallback we stop after compile + seeds, as requested.
+    print(f"[rf2] Fallback pipeline complete: binary={binary_path}")
+    return 0
+
+
 def cmd_main2fuzz(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     out = Path(args.out).resolve() if args.out else root / "reachforge2_out"
@@ -594,8 +710,18 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     else:
         prompt_path = build_main2fuzz_prompt(root, out, include_vulns=getattr(args, "include_vulns", True))
     if not prompt_path:
-        print("[rf2] Error: failed to build main2fuzz prompt. Ensure entrypoint with int main exists under app/src or src.")
-        return 2
+        print("[rf2] Warning: failed to build main2fuzz prompt from sources; falling back to bundled driver.")
+        seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
+        return _run_fallback_driver_pipeline(
+            root,
+            out,
+            workdir,
+            seeds_llm_cmd=seeds_llm_cmd,
+            seeds_model=seeds_model,
+            seeds_api_base=seeds_api_base,
+            generate_seeds=getattr(args, "generate_seeds", True),
+            seeds_max_attempts=seeds_max_attempts,
+        )
     # Schema file (informational)
     write_schema_file(out / "schemas" / "driver_spec.schema.json")
     print(f"[rf2] Prompt: {prompt_path}")
