@@ -100,16 +100,32 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
     lines.append("")
     lines.append("General guidance (style-agnostic; infer from the provided sources):")
     lines.append("- If the app is protocol/server-like, avoid listen/poll loops; synthesize minimal manager/connection and call parse(buf,len[, ver], &obj) once. If multiple versions exist, try a small deterministic subset (e.g., v4 then v5).")
-    lines.append("- If the app is library/format-like, detect type (if available) and switch to handlers; initialize minimal state structs required by those handlers.")
+    lines.append(
+        "- If the app is library/format-like, detect type (if available) and switch to handlers; initialize minimal state structs required by those handlers. "
+        "When vulnerabilities.json is available, restrict detection/dispatch to ONLY the formats or code paths whose handlers plausibly route into the listed vulnerable files/functions; "
+        "do NOT include generic 'try everything' fallbacks or handlers that cannot reach the vulnerable code."
+    )
     lines.append("- Keep the driver minimal: one read, one call sequence, and cleanup.")
     lines.append("- If the provided sources implement HTTP handlers or servers (e.g., microhttpd), do NOT reproduce endpoints.")
     lines.append("- Instead, call the underlying processing/decoder functions that accept (buffer,len) or a FILE* path.")
     lines.append("- Prefer functions declared in project headers that take const unsigned char* and size_t len, e.g., image_handle_*(buf,len,hist).")
     lines.append("")
     if vulns_blob:
-        lines.append("Optional bias (if relevant): vulnerabilities summary")
+        lines.append("Vulnerabilities summary (from vulnerabilities.json):")
         lines.append(vulns_blob)
-        lines.append("Prefer calling functions/files that are listed as affected when possible, while staying deterministic and single-shot.")
+        lines.append("Harness targeting requirements:")
+        lines.append(
+            "- Your driver MUST directly or indirectly invoke at least one function that appears in this vulnerabilities summary (affected_function) or is a clear wrapper/dispatcher that leads to those functions."
+        )
+        lines.append(
+            "- Do NOT design the driver around unrelated parsers, handlers, or subsystems that are not plausibly connected to these functions/files."
+        )
+        lines.append(
+            "- When the project exposes multiple format handlers or protocols, restrict your dispatch logic to the subset that can reach these vulnerable implementations according to filenames, headers, and call structure."
+        )
+        lines.append(
+            "- Avoid generic fallback blocks that attempt ALL handlers (e.g., PNG/JPEG/TIFF/GIF/etc.) when vulnerabilities.json only mentions a smaller set (for example, LibRaw RAW formats and WebP); only include handlers that can route into the vulnerable code."
+        )
         lines.append("")
 
     # Context: source summaries (overview)

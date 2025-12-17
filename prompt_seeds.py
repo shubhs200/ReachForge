@@ -86,7 +86,10 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append("Use these patterns to shape 10 realistic seeds (keep them small and diverse).")
         lines.append("")
     lines.append("You are given a fuzz harness that consumes input in a single-shot, deterministic manner.")
-    lines.append("Task: Output ONLY a SeedsSpec JSON with EXACTLY 10 seeds, crafted to exercise paths suggested by vulnerabilities.json.")
+    lines.append(
+        "Task: Output ONLY a SeedsSpec JSON with EXACTLY 10 seeds. Every seed MUST target one or more vulnerabilities described in vulnerabilities.json; "
+        "do NOT create seeds for formats, protocols, or code paths that are not associated with any listed vulnerability."
+    )
     lines.append("Do NOT include code fences or any prose beyond the SeedsSpec JSON itself.")
     lines.append("")
     lines.append("SeedsSpec JSON schema (reminder; follow strictly):")
@@ -105,7 +108,10 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append("")
         lines.append("Guidance:")
         lines.append("- Derive tokens/fields/lengths from affected functions/files. Create seeds that are valid-ish or near-boundary inputs to reach parsing code.")
-        lines.append("- Cover a variety of control paths (e.g., CONNECT/SUBSCRIBE/PUBLISH for MQTT; or format variants for image).")
+        lines.append(
+            "- Cover a variety of control paths within the vulnerable components only (e.g., multiple RAW/CR2 variants for LibRaw, or different chunk layouts for WebP), "
+            "not unrelated formats or protocols."
+        )
         lines.append("- Include boundary conditions (length fields near overflow/underflow, minimal/maximal topic/field sizes, etc.)")
         lines.append("Mandatory vulnerability alignment:")
         lines.append("- Produce seeds that explicitly target the functions/files listed above (e.g., LibRaw -> RAW/CR2 blobs, libwebp -> WebP frames, LibTIFF -> TIFF headers).")
@@ -113,6 +119,10 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append("- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE and expected_format in each seed's 'notes' field.")
         lines.append("- Shape headers/magic bytes/metadata so that the vulnerable functions are exercised as directly as possible; bias field lengths and chunk layouts toward the affected code paths.")
         lines.append("- When a vulnerability references an image format with specific color planes, chunk names, or compression types, mirror those details in the seed content (e.g., TIFF IFD tags, WebP VP8L chunks, LibRaw TIFF/CR2 block layouts).")
+        lines.append(
+            "- If the application supports many formats or subsystems, but vulnerabilities.json names only a subset (for example, LibRaw RAW/CR2 and WebP but not PNG/JPEG/GIF), "
+            "then generate seeds ONLY for the vulnerable formats/subsystems; do NOT include seeds for non-vulnerable handlers."
+        )
     else:
         lines.append("No vulnerabilities.json found; still produce 10 diverse seeds that exercise parsing.")
     lines.append("")
