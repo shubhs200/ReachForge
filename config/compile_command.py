@@ -120,12 +120,12 @@ APP_RULES = {
     '-Ideps/fast_float '
     '-Ideps/fpconv '
     '-Ideps/linenoise '
-    '-Ibuild/vcpkg_installed/x64-linux-cromulence/include '
-    '-Ibuild/vcpkg_installed/x64-linux-cromulence/include/hdr '
-    '-Ibuild/vcpkg_installed/x64-linux-cromulence/include/hiredis '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include/hdr '
+    '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include/hiredis '
     '{src} '
     '-o {binary} '
-    '-Lbuild/vcpkg_installed/x64-linux-cromulence/lib '
+    '-Lbuild-artifacts/vcpkg_installed/x64-linux-cromulence/lib '
     '-llua -lm -ldl -lpthread"'
     ),
 
