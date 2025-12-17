@@ -749,7 +749,7 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
                             kept_cli, rejected_cli, rej_cli_dir = _filter_bad_seeds(
                                 cli_binary,
                                 seeds_cli_dir,
-                                timeout_sec=1,
+                                timeout_sec=2,
                             )
                             print(
                                 f"[rf2] CLI seeds prescreen: kept={kept_cli}, "
