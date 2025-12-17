@@ -213,8 +213,11 @@ def _collect_cli_seeds_from_poller(root: Path, out: Path) -> int:
         if not p.is_file():
             continue
         name_low = p.name.lower()
-        # Skip poller script and Python artifacts; copy everything else
-        if name_low in ("poller.py",) or name_low.endswith((".py", ".pyc", ".pyo")):
+        # Skip the poller script and all Python artifacts
+        if name_low == "poller.py" or name_low.endswith((".py", ".pyc", ".pyo")):
+            continue
+        # Skip Dockerfiles and obvious non-input artifacts (logs, temp files)
+        if name_low.startswith("dockerfile") or name_low.endswith((".dockerfile", ".log", ".tmp")):
             continue
         dest = seeds_dir / p.name
         try:
@@ -738,7 +741,22 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
                 print(f"[rf2] CLI harness compile: {msg_cli}")
                 if ok_cli:
                     n_cli_seeds = _collect_cli_seeds_from_poller(root, out)
-                    print(f"[rf2] CLI seeds from poller: {n_cli_seeds} files -> {out / 'seeds_cli'}")
+                    seeds_cli_dir = (out / "seeds_cli").resolve()
+                    print(f"[rf2] CLI seeds from poller: {n_cli_seeds} files -> {seeds_cli_dir}")
+                    # Pre-screen CLI seeds to drop crashing/timeout inputs before fuzzing
+                    try:
+                        if seeds_cli_dir.exists():
+                            kept_cli, rejected_cli, rej_cli_dir = _filter_bad_seeds(
+                                cli_binary,
+                                seeds_cli_dir,
+                                timeout_sec=1,
+                            )
+                            print(
+                                f"[rf2] CLI seeds prescreen: kept={kept_cli}, "
+                                f"rejected={rejected_cli}, rejected_dir={rej_cli_dir}"
+                            )
+                    except Exception as e:
+                        print(f"[rf2] Warning: CLI seeds prescreen failed: {e}")
                 else:
                     print("[rf2] Warning: CLI harness compile failed; continuing with main driver only.")
 
