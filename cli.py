@@ -551,12 +551,21 @@ def _filter_bad_seeds(binary: Path, seeds_dir: Path, *, timeout_sec: int = 2) ->
 def _filter_timeout_seeds_only(binary: Path, seeds_dir: Path, *, timeout_sec: int = 2) -> tuple[int, int, Path]:
     """
     CLI-specific variant: scan seeds_dir and move only timeout-inducing seeds
-    to a _timeout subfolder. Non-zero exit codes that return quickly are
-    tolerated so that strict CLI exit-status semantics don't wipe out the
-    entire seed corpus.
+    to a _timeout subfolder.
+
+    Important: the CLI harness is typically invoked by AFL as:
+        ./fuzz_driver_cli @@ /dev/null
+    so we must mimic that invocation style here (pass the seed path as argv[1]
+    and "/dev/null" as argv[2]) instead of feeding the seed via stdin. This
+    makes the timeout check consistent with the actual fuzzing campaign.
+
+    Non-zero exit codes that return quickly are tolerated so that strict CLI
+    exit-status semantics (e.g., usage errors) don't wipe out the seed corpus.
 
     Returns (kept, rejected, rejected_dir).
     """
+    import subprocess
+
     rejected_dir = seeds_dir.parent / (seeds_dir.name + "_timeout")
     rejected_dir.mkdir(parents=True, exist_ok=True)
     kept = 0
@@ -565,9 +574,19 @@ def _filter_timeout_seeds_only(binary: Path, seeds_dir: Path, *, timeout_sec: in
         if not p.is_file():
             continue
         try:
-            rc, _so, _se = _replay_crash(binary, p, timeout_sec=timeout_sec)
-            # Only treat hard timeouts as bad for CLI seeds
-            if rc == 124:
+            # Mimic AFL invocation: binary <seed_path> /dev/null
+            args = [str(binary), str(p), "/dev/null"]
+            try:
+                subprocess.run(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_sec,
+                )
+                # Completed within timeout: keep, regardless of exit code
+                kept += 1
+            except subprocess.TimeoutExpired:
+                # Hard timeout: move seed aside so AFL won't abort on it
                 dest = rejected_dir / p.name
                 try:
                     dest.write_bytes(p.read_bytes())
@@ -578,8 +597,6 @@ def _filter_timeout_seeds_only(binary: Path, seeds_dir: Path, *, timeout_sec: in
                 except Exception:
                     pass
                 rejected += 1
-            else:
-                kept += 1
         except Exception:
             # On unexpected errors, keep the seed but log via caller if needed
             kept += 1
