@@ -100,6 +100,7 @@ APP_RULES = {
     '../../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/lib/libbz2.a '
     '../../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/lib/libcrypto.a '
     '../../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/lib/libssl.a '
+    '../../build-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/lib/libzma.a '
     '-ldl -lm"'
     ),
 
