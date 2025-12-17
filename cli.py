@@ -491,6 +491,9 @@ def _filter_bad_seeds(binary: Path, seeds_dir: Path, *, timeout_sec: int = 2) ->
     """
     Scan seeds_dir and move any crashing/timeout seeds to a _rejected subfolder so AFL won't use them.
     Returns (kept, rejected, rejected_dir).
+
+    This is intended for the main AFL harness, where we want to avoid
+    any seeds that immediately crash or hang the driver.
     """
     rejected_dir = seeds_dir.parent / (seeds_dir.name + "_rejected")
     rejected_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +545,44 @@ def _filter_bad_seeds(binary: Path, seeds_dir: Path, *, timeout_sec: int = 2) ->
                 pass
         else:
             kept = 1
+    return kept, rejected, rejected_dir
+
+
+def _filter_timeout_seeds_only(binary: Path, seeds_dir: Path, *, timeout_sec: int = 2) -> tuple[int, int, Path]:
+    """
+    CLI-specific variant: scan seeds_dir and move only timeout-inducing seeds
+    to a _timeout subfolder. Non-zero exit codes that return quickly are
+    tolerated so that strict CLI exit-status semantics don't wipe out the
+    entire seed corpus.
+
+    Returns (kept, rejected, rejected_dir).
+    """
+    rejected_dir = seeds_dir.parent / (seeds_dir.name + "_timeout")
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    rejected = 0
+    for p in sorted(seeds_dir.iterdir()):
+        if not p.is_file():
+            continue
+        try:
+            rc, _so, _se = _replay_crash(binary, p, timeout_sec=timeout_sec)
+            # Only treat hard timeouts as bad for CLI seeds
+            if rc == 124:
+                dest = rejected_dir / p.name
+                try:
+                    dest.write_bytes(p.read_bytes())
+                except Exception:
+                    pass
+                try:
+                    p.unlink(missing_ok=True)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                rejected += 1
+            else:
+                kept += 1
+        except Exception:
+            # On unexpected errors, keep the seed but log via caller if needed
+            kept += 1
     return kept, rejected, rejected_dir
 
 
@@ -743,20 +784,22 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
                     n_cli_seeds = _collect_cli_seeds_from_poller(root, out)
                     seeds_cli_dir = (out / "seeds_cli").resolve()
                     print(f"[rf2] CLI seeds from poller: {n_cli_seeds} files -> {seeds_cli_dir}")
-                    # Pre-screen CLI seeds to drop crashing/timeout inputs before fuzzing
+                    # Pre-screen CLI seeds to drop only timeout-inducing inputs before fuzzing.
+                    # CLI tools often use non-zero exit codes for normal error reporting, so we
+                    # only treat hard timeouts as bad here.
                     try:
                         if seeds_cli_dir.exists():
-                            kept_cli, rejected_cli, rej_cli_dir = _filter_bad_seeds(
+                            kept_cli, rejected_cli, rej_cli_dir = _filter_timeout_seeds_only(
                                 cli_binary,
                                 seeds_cli_dir,
                                 timeout_sec=2,
                             )
                             print(
-                                f"[rf2] CLI seeds prescreen: kept={kept_cli}, "
+                                f"[rf2] CLI timeout prescreen: kept={kept_cli}, "
                                 f"rejected={rejected_cli}, rejected_dir={rej_cli_dir}"
                             )
                     except Exception as e:
-                        print(f"[rf2] Warning: CLI seeds prescreen failed: {e}")
+                        print(f"[rf2] Warning: CLI timeout prescreen failed: {e}")
                 else:
                     print("[rf2] Warning: CLI harness compile failed; continuing with main driver only.")
 
