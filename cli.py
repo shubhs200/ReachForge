@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Optional, Tuple
@@ -157,19 +158,55 @@ def _find_cli_harness(root: Path) -> Optional[Path]:
 
 
 def _collect_cli_seeds_from_poller(root: Path, out: Path) -> int:
-    """Copy sample inputs from <root>/poller/ into <out>/seeds_cli/.
+    """Copy sample inputs from a poller directory into <out>/seeds_cli/.
+
+    Default behavior: look for ``<root>/poller``.
+
+    In CI pipelines where ``--root`` may point at a nested build/variant
+    directory that does not contain the poller tree, callers can set the
+    ``REACHFORGE_POLLER_ROOT`` environment variable to override the search
+    root. We then look for a ``poller/`` directory under that root and a
+    small number of its parents.
 
     We treat non-Python files under poller/ as seed candidates so that a
     manually maintained CLI harness (cli.cpp) can be fuzzed using the same
     inputs the poller already exercises.
+
     Returns the number of seed files copied.
     """
-    poller_dir = (root / "poller").resolve()
+    # Allow CI to override where we look for poller inputs. This is useful
+    # when --root points at a variant directory but the poller lives at the
+    # repository root.
+    poller_root_env = os.environ.get("REACHFORGE_POLLER_ROOT")
+    base_root = Path(poller_root_env).resolve() if poller_root_env else root.resolve()
+
+    # Build a small list of candidate poller/ locations: base_root/poller
+    # and a couple of its parents (to handle nested build dirs).
+    candidates: list[Path] = []
+    cur = base_root
+    for _ in range(3):  # e.g., base_root, parent, grandparent
+        cand = cur / "poller"
+        if cand not in candidates:
+            candidates.append(cand)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+    poller_dir: Optional[Path] = None
+    for cand in candidates:
+        if cand.exists() and cand.is_dir():
+            poller_dir = cand
+            break
+
+    if poller_dir is None:
+        print(
+            f"[rf2] CLI seeds: no poller/ dir found under candidates: "
+            f"{[str(c) for c in candidates]}; skipping."
+        )
+        return 0
+
     seeds_dir = (out / "seeds_cli").resolve()
     seeds_dir.mkdir(parents=True, exist_ok=True)
-
-    if not poller_dir.exists() or not poller_dir.is_dir():
-        return 0
 
     count = 0
     for p in sorted(poller_dir.rglob("*")):
@@ -185,6 +222,8 @@ def _collect_cli_seeds_from_poller(root: Path, out: Path) -> int:
             count += 1
         except Exception:
             continue
+
+    print(f"[rf2] CLI seeds: copied {count} files from poller dir {poller_dir} -> {seeds_dir}")
     return count
 
 
