@@ -25,16 +25,16 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 WORKDIR /opt
 
 # Build and install AFL++ (LLVM mode)
-RUN wget -O AFLplusplus-5.00.tar.gz https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v5.00.tar.gz && \
-    tar -xzf AFLplusplus-5.00.tar.gz && \
-    rm AFLplusplus-5.00.tar.gz && \
-    cd AFLplusplus-5.00 && \
+RUN wget -O AFLplusplus-4.17c.tar.gz https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v4.17c.tar.gz && \
+    tar -xzf AFLplusplus-4.17c.tar.gz && \
+    rm AFLplusplus-4.17c.tar.gz && \
+    cd AFLplusplus-4.17c && \
     CC=clang-19 CXX=clang++-19 LLVM_CONFIG=llvm-config-19 LLVM=1 make all && \
     make install
 
 ENV CC=clang-19
 ENV CXX=clang++-19
-ENV AFL_PATH=/opt/AFLplusplus-5.00
+ENV AFL_PATH=/opt/AFLplusplus-4.17c
 
 # Python venv
 ENV VENV=/opt/rf-venv
