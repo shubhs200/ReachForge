@@ -34,6 +34,9 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     make distrib && \
     make install && \
     cd .. && \
+    # Ensure afl-compiler-rt.o is available in the default AFL++ lib directory
+    mkdir -p /usr/local/lib/afl && \
+    cp AFLplusplus-4.09c/instrumentation/afl-compiler-rt.o /usr/local/lib/afl/afl-compiler-rt.o && \
     # Provide afl-clang-fast shims even if upstream llvm_mode install fails
     ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast && \
     ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast++
