@@ -34,7 +34,10 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     make distrib && \
     make install && \
     cd .. && \
-    rm -rf AFLplusplus-4.09c
+    rm -rf AFLplusplus-4.09c && \
+    # Provide afl-clang-fast shims even if upstream llvm_mode install fails
+    ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast && \
+    ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast++
 
 # Set environment for AFL++ and LLVM
 ENV CC=clang-19 \
