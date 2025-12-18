@@ -24,7 +24,7 @@ APP_RULES = {
     # mqtt-server (mongoose)
     "mqtt-server": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang-fast -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-I mqtt-server/app/src '
         '-I /home/shubham/ReachForge/mqtt-server/build/vcpkg_installed/x64-linux-cromulence/include '
         '{src} '
@@ -36,7 +36,7 @@ APP_RULES = {
     # analyze-image
     "analyze-image": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+        'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
         '-I. -Iapp/src -Ibuild/vcpkg_installed/x64-linux-ellf/include '
         '{src} '
         '-o {binary} '
@@ -55,7 +55,7 @@ APP_RULES = {
     # challenge
     "challenge": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+        'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
         '-I. -Iapp/src -Ibuild-artifacts/challenge/build/vcpkg_installed/x64-linux-ellf/include '
         '{src} '
         '-o {binary} '
@@ -78,8 +78,8 @@ APP_RULES = {
     ),
 
 "lamartine": (
-    'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang++ '
-    'afl-clang++ -std=c++20 -g -O1 -fsanitize=address,undefined '
+    'bash -lc "AFL_USE_ASAN=1 CXX=afl-clang-fast++ '
+    'afl-clang-fast++ -std=c++20 -g -O1 -fsanitize=address,undefined '
     '-fno-omit-frame-pointer -fuse-ld=lld '
     '-DASIO_NO_DEPRECATED -DASIO_STANDALONE -DHELLO_THERE '
     '-I. -Isrc -Isrc/doom -Isrc/tpl '
@@ -108,14 +108,14 @@ APP_RULES = {
     # cjson
     "cjson": (
         'bash -lc "AFL_USE_ASAN=1 '
-        'afl-clang -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang-fast -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-I. '
         '-o {binary} {src} '
         'cJSON.c cJSON_Utils.c"'
     ),
     "redis": (
     'bash -lc "AFL_USE_ASAN=1 '
-    'afl-clang -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
+    'afl-clang-fast -g3 -O1 -fno-omit-frame-pointer -fsanitize=address,undefined '
     '-I. -Isrc '
     '-Ideps/fast_float '
     '-Ideps/fpconv '
@@ -131,7 +131,7 @@ APP_RULES = {
 
    "cfs-eval2": (
     'bash -lc "'
-    'afl-clang -fsanitize=address -g -O1 -fno-omit-frame-pointer '
+    'afl-clang-fast -fsanitize=address -g -O1 -fno-omit-frame-pointer '
     '-Ibuild-artifacts/cfs/buildtrees/mm/src/d31fe7a035-523bcc0982.clean/fsw/inc '
     '-Ibuild-artifacts/cfs/buildtrees/mm/src/d31fe7a035-523bcc0982.clean/fsw/src '
     '-Ibuild-artifacts/cfs/buildtrees/cfs/cfs-src/cfe/modules/core_api/fsw/inc '
@@ -158,7 +158,7 @@ APP_RULES = {
 
     "cfs": (
         'bash -lc "'
-        'afl-clang -fsanitize=address -g -O1 -fno-omit-frame-pointer '
+        'afl-clang-fast -fsanitize=address -g -O1 -fno-omit-frame-pointer '
         '-Ibuild-artifacts/cfs/buildtrees/mm/src/d31fe7a035-523bcc0982.clean/fsw/inc '
         '-Ibuild-artifacts/cfs/buildtrees/mm/src/d31fe7a035-523bcc0982.clean/fsw/src '
         '-Ibuild-artifacts/cfs/buildtrees/cfs/cfs-src/cfe/modules/core_api/fsw/inc '
@@ -287,7 +287,7 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
         lib = f"build/vcpkg_installed/{trip}/lib"
         return (
             'bash -lc "AFL_USE_ASAN=1 '
-            'afl-clang -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
+            'afl-clang-fast -g -O0 -fno-omit-frame-pointer -fsanitize=address,undefined '
             f'-I. -Iapp/src -I{inc} '
             '{src} app/src/image.c '
             '-o {binary} '
@@ -320,7 +320,7 @@ def generate_compile_cmd_template(app_root: str | None = None, app_name: str | N
 
     return (
         'bash -lc "'
-        'afl-clang -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
+        'afl-clang-fast -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer '
         '-o {binary} {src} '
         '-I. -L. -lm -lpthread"'
     )

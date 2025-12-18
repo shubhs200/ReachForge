@@ -29,7 +29,7 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     tar -xzf AFLplusplus-4.09c.tar.gz && \
     rm AFLplusplus-4.09c.tar.gz && \
     cd AFLplusplus-4.09c && \
-    CC=clang-19 CXX=clang++-19 LLVM_CONFIG=llvm-config-19 make distrib && \
+    CC=clang-19 CXX=clang++-19 LLVM_CONFIG=llvm-config-19 LLVM=1 make all && \
     make install
 
 ENV CC=clang-19
