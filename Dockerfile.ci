@@ -29,12 +29,17 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     tar -xzf AFLplusplus-4.09c.tar.gz && \
     rm AFLplusplus-4.09c.tar.gz && \
     cd AFLplusplus-4.09c && \
-    CC=clang-19 CXX=clang++-19 LLVM_CONFIG=llvm-config-19 make distrib && \
-    make install
+    make distrib && \
+    make install && \
+    cd .. && \
+    rm -rf AFLplusplus-4.09c
 
-ENV CC=clang-19
-ENV CXX=clang++-19
-ENV AFL_PATH=/opt/AFLplusplus-4.09c
+# Set environment for AFL++ and LLVM
+ENV CC=clang-19 \
+    CXX=clang++-19 \
+    LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
+    AFL_PATH=/usr/local/lib/afl \
+    PATH="/usr/local/bin:${PATH}"
 
 # Python venv
 ENV VENV=/opt/rf-venv
