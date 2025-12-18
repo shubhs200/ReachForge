@@ -25,10 +25,12 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 WORKDIR /opt
 
 # Build and install AFL++ (LLVM mode)
+# Patch AFL++ llvm_mode for LLVM 19+ (StringRef::startswith -> starts_with)
 RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v4.09c.tar.gz && \
     tar -xzf AFLplusplus-4.09c.tar.gz && \
     rm AFLplusplus-4.09c.tar.gz && \
     cd AFLplusplus-4.09c && \
+    sed -i 's/\.startswith(/.starts_with(/' instrumentation/afl-llvm-common.cc && \
     make distrib && \
     make install && \
     cd .. && \
