@@ -230,6 +230,66 @@ def _collect_cli_seeds_from_poller(root: Path, out: Path) -> int:
     return count
 
 
+def _synthesize_cdf_seeds(seeds_dir: Path) -> int:
+    """Synthesize a small set of generic CDF/OLE-style inputs.
+
+    These are self-contained Compound Document File (CDF) like blobs that
+    resemble the seeds we use to exercise libmagic's CDF parser. We do not
+    read from any on-disk magic_seeds directory so that this logic is fully
+    portable across targets.
+    """
+    seeds: dict[str, bytes] = {}
+
+    # 1) Classic CDF header-only blob with some padding.
+    #    Magic bytes: D0 CF 11 E0 A1 B1 1A E1
+    seeds["cdf_header_only.bin"] = bytes.fromhex("D0CF11E0A1B11AE1") + b"\x00" * 64
+
+    # 2) Minimal valid-ish CDF header + a small region of zeros to mimic
+    #    a tiny FAT / directory area. This is intentionally rough but
+    #    structurally closer to a real file than the pure header.
+    hdr = bytearray(512)
+    hdr[0:8] = bytes.fromhex("D0CF11E0A1B11AE1")
+    # sector size = 512 (2^9)
+    hdr[0x1E:0x20] = (0x0009).to_bytes(2, "little")
+    # mini sector size = 64 (2^6)
+    hdr[0x20:0x22] = (0x0006).to_bytes(2, "little")
+    seeds["cdf_minimal_validish.bin"] = bytes(hdr) + b"\x00" * 1024
+
+    # 3) Truncated header. Good for boundary and short-read behavior.
+    seeds["cdf_truncated.bin"] = bytes.fromhex("D0CF11E0A1B11AE1")
+
+    # 4) Header with inconsistent/"weird" sector sizes to nudge parsers
+    #    down less-tested error paths.
+    weird = bytearray(512)
+    weird[0:8] = bytes.fromhex("D0CF11E0A1B11AE1")
+    weird[0x1E:0x20] = (0x0002).to_bytes(2, "little")  # nonsensical sector size
+    weird[0x20:0x22] = (0x0001).to_bytes(2, "little")
+    seeds["cdf_weird_sector_sizes.bin"] = bytes(weird)
+
+    # 5) Extra tiny seed: header + a few bytes of non-zero data.
+    seeds["seed_cdf_minimal.bin"] = bytes.fromhex("D0CF11E0A1B11AE1") + b"\x01\x00\x00\x00"
+
+    count = 0
+    for name, data in seeds.items():
+        try:
+            (seeds_dir / name).write_bytes(data)
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def _prepare_cdf_seeds(out: Path) -> int:
+    """Create <out>/seeds_cdf and populate it with synthesized CDF seeds.
+
+    This is currently only invoked from the AFG + CLI harness path so that
+    libmagic-style CDF parsing gets an additional corpus alongside seeds_cli.
+    """
+    seeds_dir = (out / "seeds_cdf").resolve()
+    seeds_dir.mkdir(parents=True, exist_ok=True)
+    return _synthesize_cdf_seeds(seeds_dir)
+
+
 def _write_seeds_files(spec: dict, out_dir: Path, app_name: str) -> tuple[bool, str, Path]:
     """
     Decode and write seed files under <out_dir>/seeds/<app_name>/.
@@ -817,6 +877,15 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
                             )
                     except Exception as e:
                         print(f"[rf2] Warning: CLI timeout prescreen failed: {e}")
+
+                    # In AFG + CLI mode, also synthesize CDF-style seeds that
+                    # help exercise libmagic-like CDF parsing behavior.
+                    try:
+                        n_cdf = _prepare_cdf_seeds(out)
+                        seeds_cdf_dir = (out / "seeds_cdf").resolve()
+                        print(f"[rf2] CDF seeds synthesized: {n_cdf} files -> {seeds_cdf_dir}")
+                    except Exception as e:
+                        print(f"[rf2] Warning: CDF seed synthesis failed: {e}")
                 else:
                     print("[rf2] Warning: CLI harness compile failed; continuing with main driver only.")
 
