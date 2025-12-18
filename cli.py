@@ -962,17 +962,9 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
 
     # 6) Seeds generation (default: enabled; disable with --no-generate-seeds)
     if getattr(args, "generate_seeds", True):
-        seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
-        rc = _maybe_generate_seeds(
-            root,
-            out,
-            llm_cmd=seeds_llm_cmd,
-            model=seeds_model,
-            api_base=seeds_api_base,
-            max_attempts=seeds_max_attempts,
-        )
-        if rc != 0:
-            return rc
+        # Non-AFG path: use poller inputs as seeds instead of LLM
+        n_cli_seeds = _collect_cli_seeds_from_poller(root, out)
+        print(f"[rf2] Non-AFG poller seeds copied: {n_cli_seeds}")
 
     # 6.5) Create compatibility layout for downstream CI expecting fuzz-out structure
     try:
