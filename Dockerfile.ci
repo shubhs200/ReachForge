@@ -7,7 +7,8 @@ LABEL version="1.0"
 
 # Base packages
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-    build-essential libc6-dev gcc-13 g++-13 clang-19 lld-19 \
+    build-essential libc6-dev gcc-13 g++-13 \
+    clang-17 lld-17 \
     python3 python3-venv python3-pip python3-pil \
     cmake ninja-build make \
     tar xz-utils file \
@@ -16,37 +17,26 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     binutils gdb valgrind \
     libcapstone-dev \
     graphviz \
-    llvm-19-dev llvm-19-tools libclang-rt-19-dev \
+    llvm-17-dev llvm-17-tools libclang-rt-17-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100 \
-    && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100 \
-    && update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-19 100
+    && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 100 \
+    && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-17 100 \
+    && update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-17 100
 
 WORKDIR /opt
 
 # Build and install AFL++ (LLVM mode)
-# Patch AFL++ llvm_mode for LLVM 19+ (StringRef::startswith -> starts_with)
 RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/archive/refs/tags/v4.09c.tar.gz && \
     tar -xzf AFLplusplus-4.09c.tar.gz && \
     rm AFLplusplus-4.09c.tar.gz && \
     cd AFLplusplus-4.09c && \
-    sed -i 's/\.startswith(/.starts_with(/' instrumentation/afl-llvm-common.cc && \
-    make distrib && \
-    make install && \
-    cd .. && \
-    # Ensure afl-compiler-rt.o is available in the default AFL++ lib directory
-    mkdir -p /usr/local/lib/afl && \
-    cp AFLplusplus-4.09c/instrumentation/afl-compiler-rt.o /usr/local/lib/afl/afl-compiler-rt.o && \
-    # Provide afl-clang-fast shims even if upstream llvm_mode install fails
-    ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast && \
-    ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast++
+    CC=clang-17 CXX=clang++-17 LLVM_CONFIG=llvm-config-17 make distrib && \
+    make install
 
-# Set environment for AFL++ and LLVM
-ENV CC=clang-19 \
-    CXX=clang++-19 \
-    LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
-    AFL_PATH=/opt/AFLplusplus-4.09c \
-    PATH="/usr/local/bin:${PATH}"
+ENV CC=clang-17
+ENV CXX=clang++-17
+ENV AFL_PATH=/opt/AFLplusplus-4.09c
+ENV PATH="/usr/local/bin:$PATH"
 
 # Python venv
 ENV VENV=/opt/rf-venv
@@ -59,9 +49,7 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt
 COPY . .
 
-# Environment for runtime: ensure parent dir of the package is on sys.path
-# This allows `python3 -m reachforge.cli` to work from any CWD in the container
+# Environment for runtime
 ENV PYTHONPATH=/opt
 
-# Default command prints help
 CMD ["python3", "-m", "reachforge.cli", "--help"]
