@@ -91,6 +91,7 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
     lines.append("- Prohibit servers/event loops/threads/sockets/sleeps/RNG/time-based behaviors.")
     lines.append("- Ignore benign parse errors; then cleanup and return 0.")
     lines.append("- Do NOT modify any existing source files. Produce a new program only.")
+    lines.append("- Do NOT introduce custom fast detection logic")
     lines.append("")
     lines.append("DriverSpec JSON (schema reminder; DO NOT add extra fields or text):")
     lines.append(json.dumps(DRIVER_SPEC_SCHEMA, indent=2))
