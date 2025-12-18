@@ -238,14 +238,14 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
     lines.append("- Prefer driving low-level primitives via the public helper or parsing functions that call them (as suggested by the AFG call paths) instead of calling them in isolation with null or dummy state pointers.")
     lines.append("- Reuse the fuzz input buffer in multiple logically distinct ways inside one execution. For example, treat an initial control byte or small header as a selector and use the remaining bytes as payload for one or more helper functions that eventually reach the vulnerable API.")
     lines.append("- When the AFG provides call paths such as main -> helper -> vulnerable_function, design the driver so it calls the same helper with fuzz-controlled arguments that mimic what main would normally produce, instead of bypassing it.")
-    lines.append("- When functions take indices, offsets, or sizes, derive these from structured slices of the input (for example, interpret a few tail bytes as signed or unsigned integers, clamp or normalize them, and then use them as bounds or index parameters) so that edge cases around boundaries are exercised.")
+    lines.append("- When functions take indices, offsets, or sizes, derive these from structured slices of the input (for example, interpret 4 or 8 tail bytes as 32-bit signed integers, clamp or normalize them only as needed to avoid undefined behavior, and then use them as bounds or index parameters) so that edge cases around boundaries are exercised.")
     lines.append("- If a vulnerable API consumes string or buffer data, consider both indirect use (through a normal parser or loader that calls it internally) and direct use (calling it with raw fuzz bytes) when this is consistent with its signature and headers, while keeping the harness single-shot and deterministic.")
-    lines.append("- When a vulnerable API is part of a language runtime or scripting engine and the entry file or headers expose load/compile helpers (for example, functions that compile or evaluate a buffer as source), first invoke those helpers with the entire fuzz buffer. Treat compilation or parse errors as benign: ignore them and continue.")
-    lines.append("- After exercising such a high-level load/parse step, also call at least one lower-level or more focused API directly with fuzz-derived arguments (for example, slices of the same buffer) so that both the parser/compiler and the primitive are exercised in a single execution, but only when those lower-level APIs are declared in the allowed headers or visible sources (do not invent extern declarations for internal-only symbols).")
+    lines.append("- When a vulnerable API is part of a language runtime or scripting engine and the entry file or headers expose load/compile helpers (for example, functions that compile or evaluate a buffer as source), first invoke those helpers with the entire fuzz buffer. Treat compilation or parse errors as benign: ignore them and continue; do not exit or abort the process on such errors.")
+    lines.append("- After exercising such a high-level load/parse step, also call at least one lower-level or more focused API directly with fuzz-derived arguments (for example, slices of the same buffer, or indices into tables/arrays built from the buffer) so that both the parser/compiler and the primitive are exercised in a single execution, but only when those lower-level APIs are declared in the allowed headers or visible sources (do not invent extern declarations for internal-only symbols).")
     lines.append("- Avoid introducing new 'extern' declarations or forward declarations for vulnerable/internal functions that are not declared in any of the allowed headers or entry file; instead, reach those implementations indirectly via their public wrappers, globals, or helper functions indicated by the AFG call_paths or api_flow_edges.")
     lines.append("- If an AFG api node appears to represent an internal/private function (for example, only defined in a .c file and not declared in the visible headers), treat it as an implementation detail and target it through the public APIs that call it, rather than naming or calling that internal symbol directly in your driver.")
 
-    lines.append("- For APIs that operate on tables, arrays, or ranges, construct a container object from a prefix of the fuzz buffer, then derive one or two index parameters from later bytes. Interpret a few tail bytes as integers, clamp or normalize them into the valid range, and occasionally swap them so that start <= end most of the time but some executions still explore start > end behaviors.")
+    lines.append("- For APIs that operate on tables, arrays, or index ranges, construct a concrete container object from a prefix of the fuzz buffer (for example, one element per byte or per small group of bytes), then derive one or two signed index parameters from later bytes (for example, interpret the last 8 bytes as two 32-bit signed integers). Clamp or normalize these indices only as needed to avoid undefined behavior, and occasionally swap them so that start <= end most of the time but some executions still explore start > end, negative, zero, and equal-index cases.")
     lines.append("- When the AFG or vulnerabilities summary describe a specific function name in a particular file or module, and the entry file or headers expose a public symbol or global with that exact name, prefer calling that symbol (or the global it registers) over loosely related helpers.")
     lines.append("- Whenever it is safe and consistent with the headers, try to use the same fuzz buffer both as raw source or configuration (for example, passed to a load/parse/compile helper) and as binary or structured data (for example, elements of a container or payload passed to a lower-level API) by first invoking a load/parse function on the entire buffer and then slicing it into segments for secondary calls.")
     lines.append("")
@@ -306,6 +306,30 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
                     desc_parts.append(f"signature: {sig}")
                 lines.append("- " + " | ".join(desc_parts))
             lines.append("")
+
+            # If any vulnerable APIs appear to operate on containers or index ranges
+            # (simple name-based heuristic), add extra generic guidance on how to
+            # map fuzz input to those APIs.
+            unpack_like = False
+            for n in api_nodes:
+                name = (n.get("label") or n.get("id") or "").lower()
+                if any(tok in name for tok in ("unpack", "slice", "range", "sub", "segment", "copy")):
+                    unpack_like = True
+                    break
+            if unpack_like:
+                lines.append(
+                    "Some vulnerable APIs appear to operate on containers or index ranges (for example, their names include terms like 'unpack', 'slice', 'range', 'sub', 'segment', or similar)."
+                )
+                lines.append(
+                    "For such APIs, construct a concrete container object (such as a table, array, vector, or list) whose elements come directly from a prefix of the fuzz buffer, then derive start/end or index parameters from the tail of the input as signed integers."
+                )
+                lines.append(
+                    "Interpret at least 8 tail bytes as two 32-bit signed integers, clamp or normalize them only as needed to avoid undefined behavior, and occasionally swap them so that start <= end most of the time while still exploring negative indices, zero, equal indices, and start > end edge cases."
+                )
+                lines.append(
+                    "Avoid designs that rely solely on fragile format strings or early-failing parse paths; instead, make sure the index/range-based path is reachable for a wide variety of inputs by mapping fuzzer bytes directly into the container elements and index parameters."
+                )
+                lines.append("")
 
         # Then, show any simple entry→...→vuln call paths discovered
         if call_paths:
