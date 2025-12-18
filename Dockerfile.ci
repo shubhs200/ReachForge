@@ -16,11 +16,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     binutils gdb valgrind \
     libcapstone-dev \
     graphviz \
-    llvm-19-dev llvm-19-tools libclang-rt-19-dev \
+    llvm-15-dev llvm-15-tools libclang-rt-15-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100 \
-    && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100 \
-    && update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-19 100
+    && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100 \
+    && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100 \
+    && update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-15 100
 
 WORKDIR /opt
 
@@ -29,11 +29,11 @@ RUN wget -O AFLplusplus-4.17c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     tar -xzf AFLplusplus-4.17c.tar.gz && \
     rm AFLplusplus-4.17c.tar.gz && \
     cd AFLplusplus-4.17c && \
-    CC=clang-19 CXX=clang++-19 LLVM_CONFIG=llvm-config-19 LLVM=1 make all && \
+    CC=clang-15 CXX=clang++-15 LLVM_CONFIG=llvm-config-15 LLVM=1 make all && \
     make install
 
-ENV CC=clang-19
-ENV CXX=clang++-19
+ENV CC=clang-15
+ENV CXX=clang++-15
 ENV AFL_PATH=/opt/AFLplusplus-4.17c
 
 # Python venv
