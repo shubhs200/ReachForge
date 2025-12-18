@@ -34,7 +34,6 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
     make distrib && \
     make install && \
     cd .. && \
-    rm -rf AFLplusplus-4.09c && \
     # Provide afl-clang-fast shims even if upstream llvm_mode install fails
     ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast && \
     ln -sf /usr/local/bin/afl-cc /usr/local/bin/afl-clang-fast++
@@ -43,7 +42,7 @@ RUN wget -O AFLplusplus-4.09c.tar.gz https://github.com/AFLplusplus/AFLplusplus/
 ENV CC=clang-19 \
     CXX=clang++-19 \
     LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
-    AFL_PATH=/usr/local/lib/afl \
+    AFL_PATH=/opt/AFLplusplus-4.09c \
     PATH="/usr/local/bin:${PATH}"
 
 # Python venv
