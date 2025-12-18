@@ -963,8 +963,20 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
     # 6) Seeds generation (default: enabled; disable with --no-generate-seeds)
     if getattr(args, "generate_seeds", True):
         if not getattr(args, "use_afg", False):
-            n_cli_seeds = _collect_cli_seeds_from_poller(root, out)
-            print(f"[rf2] Non-AFG poller seeds copied: {n_cli_seeds}")
+            # Copy poller seeds into seeds/<app>/ instead of seeds_cli/
+            seeds_dir = (out / "seeds" / root.name)
+            seeds_dir.mkdir(parents=True, exist_ok=True)
+            # Manually copy from poller into seeds/app
+            n_cli_seeds = 0
+            for p in sorted((root / "poller").rglob("*")):
+                if p.is_file() and not p.name.lower().endswith((".py", ".pyc", ".pyo", ".log", ".tmp")):
+                    dest = seeds_dir / p.name
+                    try:
+                        shutil.copy2(p, dest)
+                        n_cli_seeds += 1
+                    except Exception:
+                        pass
+            print(f"[rf2] Non-AFG poller seeds copied into seeds/{root.name}: {n_cli_seeds}")
         else:
             # Restore original AFG behavior using LLM-generated seeds
             seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
