@@ -114,14 +114,6 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
     lines.append("- Prefer functions declared in project headers that take const unsigned char* and size_t len, e.g., image_handle_*(buf,len,hist).")
     lines.append("- Keep per-iteration overhead low in the fuzz driver: avoid building expensive debug-only JSON summaries (for example, histogram dumps), duplicating includes or heavy setup on every iteration, or running multi-pass fallback detection logic unless it is required to reach the target parsing/decoder code.")
     lines.append("- When using persistent mode, hoist immutable tables and configuration out of the main fuzz loop where possible, while keeping all input-dependent behavior inside the loop so that each iteration remains deterministic and isolated.")
-    lines.append("- When the target exposes an embedded interpreter, virtual machine, or scripting-like runtime, initialize that runtime using its normal creation and library-initialization functions (as visible in the sources) and then drive it using the fuzz buffer.")
-    lines.append("- In that case, reuse the same input buffer in multiple ways: (1) treat it as a high-level script/program that is compiled/loaded and, when possible, executed; (2) treat it as a raw blob passed to core data-creation APIs (for example, functions that create strings, tables, arrays, or similar containers); and (3) drive APIs that operate on containers with index/range/offset parameters.")
-    lines.append("- Prefer driving core or global container/sequence APIs (for example, functions that conceptually operate on a list or table and take start/end or index parameters) over narrow methods on specific library tables when both are visible in the headers or entry file.")
-    lines.append("- If a container/sequence API is exposed both as a top-level or core function and as a method on a specific module or table, prefer calling the top-level/core variant directly rather than going through module-specific helpers or wrappers that may not be present in all builds.")
-    lines.append("- Do not assume that particular helper modules or namespaces expose advanced functions unless they are declared in the provided headers or entry file; choose APIs and call patterns based on what you actually see in the project sources, not on language-specific conventions.")
-    lines.append("- Do NOT call functions, methods, or symbols that are not declared, defined, or referenced anywhere in the provided sources/headers/entry file; do not invent APIs based on prior knowledge of a language runtime or standard library.")
-    lines.append("- For container+index/range APIs, first build a container (array/list/table/etc.) from a prefix of the fuzz buffer and then derive indices, offsets, or bounds from later bytes (for example, interpret 4 or 8 tail bytes as signed/unsigned integers, clamp into valid ranges, and occasionally swap them so start <= end while still exploring start > end).")
-    lines.append("- Avoid hardcoding indices or counts for such APIs; instead, map them from the fuzz data so that boundary and out-of-range behaviors are explored, while still keeping the harness deterministic and single-shot.")
     lines.append("")
     if vulns_blob:
         lines.append("Optional bias (if relevant): vulnerabilities summary")
@@ -138,44 +130,6 @@ def build_main2fuzz_prompt(root: Path, out_dir: Path, *, include_vulns: bool = F
         lines.append("Project source summaries (functions and includes):")
         lines.append(summaries)
         lines.append("")
-
-    # Optional: existing fuzz or harness examples to bias style/structure
-    try:
-        fuzz_example_paths: list[Path] = []
-        for pattern in ("*fuzz*.c", "*fuzz*.cc", "*fuzz*.cpp"):
-            try:
-                fuzz_example_paths.extend(root.rglob(pattern))
-            except Exception:
-                continue
-        # De-duplicate, filter obviously irrelevant dirs, and keep a small subset
-        seen_paths: set[Path] = set()
-        selected_examples: list[tuple[Path, str]] = []
-        for p in fuzz_example_paths:
-            if p in seen_paths:
-                continue
-            seen_paths.add(p)
-            # Skip build/artifact directories to avoid huge or generated files
-            parts = {part.lower() for part in p.parts}
-            if {"build", "fuzz-out", "fuzz_out", "afl_out", "challenge-harness-artifacts"} & parts:
-                continue
-            try:
-                text = p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            # Skip extremely large files
-            if len(text) > 20000:
-                continue
-            selected_examples.append((p, text))
-            if len(selected_examples) >= 3:
-                break
-        if selected_examples:
-            lines.append("Existing fuzz or harness examples in this project (for reference; adapt patterns but do NOT copy verbatim):")
-            for p, text in selected_examples:
-                lines.append(f"// existing fuzz file: {p}")
-                lines.append(text)
-            lines.append("")
-    except Exception:
-        pass
 
     # Entry-defined helper functions available to lift verbatim
     try:
