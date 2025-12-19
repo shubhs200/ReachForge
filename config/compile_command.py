@@ -125,7 +125,7 @@ APP_RULES = {
     '-Ibuild-artifacts/vcpkg_installed/x64-linux-cromulence/include/hiredis '
     '{src} '
     '-o {binary} '
-    '-Lbuild/vcpkg_installed/x64-linux-cromulence/lib '
+    '-Lbuild-artifacts/vcpkg_installed/x64-linux-cromulence/lib '
     '-llua -lm -ldl -lpthread"'
     ),
 
