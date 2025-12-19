@@ -262,6 +262,8 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
     lines.append("- Do NOT use lua_createtable + lua_settable – this goes through metatables unnecessarily; use the faster raw path instead.")
     lines.append("- Do NOT derive both indices from the same offset or use big-endian loads – use little-endian 32-bit loads from two distinct positions near the end of the input.")
     lines.append("- Do NOT make the driver long or modular with separate functions – keep everything compact and inline in main().")
+    lines.append("- COMMON CRITICAL ERROR: Do NOT call lua_pcall immediately after luaL_loadbuffer without checking the result. On syntax errors (most inputs), loadbuffer pushes an error string, not a function. You MUST check the return code: only pcall if load succeeded, and always pop the error object if load failed — otherwise the stack is corrupted for later stages and compilation-time interning paths are skipped.")
+    lines.append("- Do NOT change the swap probability (e.g., using & 3 or & 7) — use a simple ~50% condition based on one bit so that inverted index cases remain well-explored.")
     lines.append("")
     lines.append("**REQUIRED CORRECT BEHAVIOR FOR THIS LUA TARGET:**")
     lines.append("- Fixed-size static buffer (exactly one hard-coded capacity around 64 KiB), read all of stdin once.")
