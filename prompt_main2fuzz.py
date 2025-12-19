@@ -216,7 +216,7 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
     lines.append("Your task: output ONLY a DriverSpec JSON (no prose, no code fences) that defines a brand-new, single-shot fuzz driver (a separate program).")
     lines.append("")
     lines.append("The driver must:")
-    lines.append("- Read stdin into a bounded buffer (cap to a safe limit).")
+    lines.append("- Read stdin into a bounded buffer (cap to a safe limit, typically on the order of tens of kilobytes such as ~64 KiB, rather than multiple megabytes, to keep per-execution cost low).")
     lines.append("- Build just enough state/context to exercise one or more vulnerable or high-risk APIs identified in the AFG, in a deterministic, single-shot manner.")
     lines.append("- Avoid reproducing servers, event loops, signal handlers, or threads from main; instead, construct the minimal objects needed and invoke the core logic once.")
     lines.append("- Ignore benign parse errors; then cleanup and return 0.")
@@ -322,7 +322,10 @@ def build_afg_prompt(root: Path, out_dir: Path, afg_path: Path) -> Optional[Path
                     "Some vulnerable APIs appear to operate on containers or index ranges (for example, their names include terms like 'unpack', 'slice', 'range', 'sub', 'segment', or similar)."
                 )
                 lines.append(
-                    "For such APIs, construct a concrete container object (such as a table, array, vector, or list) using only a small prefix of the fuzz buffer (for example, at most a few hundred elements) so that the harness remains fast while still stressing the index-handling logic."
+                    "For such APIs, construct a concrete container object (such as a table, array, vector, or list) using only a small prefix of the fuzz buffer (for example, at most a few hundred elements) so that the harness remains fast while still stressing the index-handling logic. By default, store each element as a simple scalar value (for example, an integer derived from a single byte) rather than mixing many different element types, unless the vulnerability description clearly depends on heterogenous containers."
+                )
+                lines.append(
+                    "Choose the container length as a simple bounded function of the available prefix length (for example, min(prefix_bytes, 256)) so that most inputs produce non-trivial containers without blowing up per-execution cost."
                 )
                 lines.append(
                     "Derive start/end or index parameters from the tail of the input as 32-bit signed integers (for example, interpret the last 8 bytes as two int32 values) and use them directly as indices; only clamp when strictly required to avoid undefined behavior such as integer overflow or excessive allocation."
