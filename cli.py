@@ -1038,7 +1038,7 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
             # Manually copy from poller into seeds/app
             n_cli_seeds = 0
             for p in sorted((root / "poller").rglob("*")):
-                if p.is_file() and not p.name.lower().endswith((".py", ".pyc", ".pyo", ".log", ".tmp",".poller",".bmp",".jpg",".gif",".jp2",".png")):
+                if p.is_file() and not p.name.lower().endswith((".py", ".pyc", ".pyo", ".log", ".tmp",".poller",".bmp",".jpg",".gif",".jp2",".png",".tiff")):
                     dest = seeds_dir / p.name
                     try:
                         shutil.copy2(p, dest)
