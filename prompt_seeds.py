@@ -107,71 +107,22 @@ def build_seeds_prompt(root: Path, out_dir: Path, *, include_poller: bool = True
         lines.append(json.dumps(vulns_subset, indent=2))
         lines.append("")
         lines.append("Guidance:")
+        lines.append("- Derive tokens/fields/lengths from affected functions/files. Create seeds that are valid-ish or near-boundary inputs to reach parsing code.")
         lines.append(
-            "- Start from inputs that would be well-formed or realistic for the vulnerable format/subsystem, "
-            "then apply minimal, targeted corruptions in the fields that drive the vulnerable behavior "
-            "(sizes, counts, indexes, offsets, chunk lengths, etc.)."
+            "- Cover a variety of control paths within the vulnerable components only (e.g., multiple RAW/CR2 variants for LibRaw, or different chunk layouts for WebP), "
+            "not unrelated formats or protocols."
         )
-        lines.append(
-            "- Derive tokens/fields/lengths directly from the affected functions/files and their expected structures. "
-            "Prefer seeds that are valid-ish and get as deep as possible into parsing before failing."
-        )
-        lines.append(
-            "- Include boundary conditions closely tied to the vulnerabilities: values just below/above limits, "
-            "off-by-one sizes, near-overflow lengths, minimal/maximal topic or field sizes, etc."
-        )
-        lines.append(
-            "- Cover a variety of control paths within the vulnerable components only (for example, multiple RAW/CR2 variants "
-            "for LibRaw or different chunk layouts for a single image format), not unrelated formats or protocols."
-        )
+        lines.append("- Include boundary conditions (length fields near overflow/underflow, minimal/maximal topic/field sizes, etc.)")
         lines.append("Mandatory vulnerability alignment:")
+        lines.append("- Produce seeds that explicitly target the functions/files listed above (e.g., LibRaw -> RAW/CR2 blobs, libwebp -> WebP frames, LibTIFF -> TIFF headers).")
+        lines.append("- Each seed must conform to the expected input format listed in vulnerabilities.json (e.g., TIFF/JPEG/WebP framing, LibRaw RAW structures, MQTT control packets).")
+        lines.append("- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE and expected_format in each seed's 'notes' field.")
+        lines.append("- Shape headers/magic bytes/metadata so that the vulnerable functions are exercised as directly as possible; bias field lengths and chunk layouts toward the affected code paths.")
+        lines.append("- When a vulnerability references an image format with specific color planes, chunk names, or compression types, mirror those details in the seed content (e.g., TIFF IFD tags, WebP VP8L chunks, LibRaw TIFF/CR2 block layouts).")
         lines.append(
-            "- Produce seeds that explicitly target the functions/files listed above. For example, if a vulnerability "
-            "describes RAW/CR2 processing in a LibRaw entry, use RAW/CR2-like inputs that exercise that code path; if it "
-            "describes a WebP decoder function, use WebP-like frames."
-        )
-        lines.append(
-            "- Each seed must conform to the expected input format listed in vulnerabilities.json (via its input-format/format/protocol "
-            "fields, or as implied by the description), rather than inventing unrelated formats."
-        )
-        lines.append(
-            "- Generate at least one seed per vulnerability entry and reference the corresponding CVE/CWE and expected_format "
-            "in each seed's 'notes' field."
-        )
-        lines.append(
-            "- Shape headers/magic bytes/metadata so that the vulnerable functions are exercised as directly as possible; "
-            "bias field lengths and chunk layouts toward the affected code paths."
-        )
-        lines.append(
-            "- When a vulnerability references specific structures (such as particular tags, chunks, or color planes), "
-            "mirror those details in the seed content as closely as possible."
-        )
-        lines.append(
-            "- Avoid obviously invalid garbage blobs (wrong magic, impossible top-level sizes) unless the vulnerability "
-            "explicitly concerns such cases; prefer \"almost valid\" inputs with small, targeted corruptions."
-        )
-        lines.append(
-            "- If the application supports many formats or subsystems, but vulnerabilities.json names only a subset, "
+            "- If the application supports many formats or subsystems, but vulnerabilities.json names only a subset (for example, LibRaw RAW/CR2 and WebP but not PNG/JPEG/GIF), "
             "then generate seeds ONLY for the vulnerable formats/subsystems; do NOT include seeds for non-vulnerable handlers."
         )
-
-        app_name = root.name
-        if app_name == "image-histogram":
-            lines.append("Image-histogram specific guidance:")
-            lines.append(
-                "- Prioritize the first vulnerability (LibRaw RAW processing in raw2image_ex on Canon-style CR2 inputs). "
-                "Most seeds should be Canon CR2-like RAW images that look structurally valid but carry slightly malformed "
-                "size/pitch or row-stride metadata to stress memmove-based row copying."
-            )
-            lines.append(
-                "- Canon CR2 is a TIFF-based RAW format that typically starts with a little-endian TIFF header, "
-                "followed by a 'CR2' marker and EXIF-style tags (such as date/time and camera make/model). Shape seeds "
-                "to preserve this overall layout while varying the dimensions and pitch-related fields."
-            )
-            lines.append(
-                "- Focus your 10 seeds on RAW/CR2-style inputs that reach LibRaw's raw2image_ex path quickly, instead of "
-                "inventing seeds for unrelated image formats that are not described by any vulnerability entry."
-            )
     else:
         lines.append("No vulnerabilities.json found; still produce 10 diverse seeds that exercise parsing.")
     lines.append("")

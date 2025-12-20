@@ -1031,18 +1031,34 @@ def cmd_main2fuzz(args: argparse.Namespace) -> int:
 
     # 6) Seeds generation (default: enabled; disable with --no-generate-seeds)
     if getattr(args, "generate_seeds", True):
-        # Use vulnerabilities.json + DriverSpec-guided LLM seeds for both AFG and non-AFG paths.
-        seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
-        rc = _maybe_generate_seeds(
-            root,
-            out,
-            llm_cmd=seeds_llm_cmd,
-            model=seeds_model,
-            api_base=seeds_api_base,
-            max_attempts=seeds_max_attempts,
-        )
-        if rc != 0:
-            return rc
+        if not getattr(args, "use_afg", False):
+            # Copy poller seeds into seeds/<app>/ instead of seeds_cli/
+            seeds_dir = (out / "seeds" / root.name)
+            seeds_dir.mkdir(parents=True, exist_ok=True)
+            # Manually copy from poller into seeds/app
+            n_cli_seeds = 0
+            for p in sorted((root / "poller").rglob("*")):
+                if p.is_file() and not p.name.lower().endswith((".py", ".pyc", ".pyo", ".log", ".tmp",".poller",".bmp",".jpg",".gif",".jp2",".png",".tiff")):
+                    dest = seeds_dir / p.name
+                    try:
+                        shutil.copy2(p, dest)
+                        n_cli_seeds += 1
+                    except Exception:
+                        pass
+            print(f"[rf2] Non-AFG poller seeds copied into seeds/{root.name}: {n_cli_seeds}")
+        else:
+            # Restore original AFG behavior using LLM-generated seeds
+            seeds_max_attempts = int(getattr(args, "seeds_max_attempts", 3))
+            rc = _maybe_generate_seeds(
+                root,
+                out,
+                llm_cmd=seeds_llm_cmd,
+                model=seeds_model,
+                api_base=seeds_api_base,
+                max_attempts=seeds_max_attempts,
+            )
+            if rc != 0:
+                return rc
 
     # 6.5) Create compatibility layout for downstream CI expecting fuzz-out structure
     try:
