@@ -1,0 +1,10 @@
+{
+  "vulnerabilities": [{
+    "cve-id": "CVE-2025-64505",
+    "package-name": "libpng",
+    "package-version": "1.6.50",
+    "cwe-id": "CWE-125",
+    "affected-file": "pngrtran.c",
+    "affected-function": "png_do_quantize"
+  }]
+}

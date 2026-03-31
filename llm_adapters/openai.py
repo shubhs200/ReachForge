@@ -1,11 +1,10 @@
-from __future__ import annotations
-
 import json
 import os
+import time
 from pathlib import Path
 from typing import Optional, Tuple
-
-import requests
+import urllib.request
+import urllib.error
 
 
 def _read_text(p: Path) -> str:
@@ -15,25 +14,17 @@ def _read_text(p: Path) -> str:
         return ""
 
 
-def run_openai_json(prompt_path: Path, out_path: Path, *, model: str, api_base: Optional[str] = None) -> Tuple[bool, str]:
+def run_openai_json(prompt_path: Path, out_path: Path, *, model: str, api_base: Optional[str] = None, max_retries: int = 3) -> Tuple[bool, str]:
     """
-    Minimal JSON-only chat wrapper.
-    - Reads prompt markdown from prompt_path
-    - Calls {api_base or https://api.openai.com/v1}/chat/completions
-    - Writes the assistant message content to out_path (as-is)
-    - Returns (ok, msg)
-
-    Requirements:
-      - Env OPENAI_API_KEY must be set (Bearer token)
-      - `requests` must be installed (see reachforge4/requirements.txt)
-
-    Notes:
-      - This helper does not add additional retrieval logic; RF4 handles that.
-      - We ask the model to output ONLY a single JSON object. RF4 callers may
-        further validate/clip code fences where necessary.
+    OpenAI ChatCompletion JSON wrapper using urllib (Python 3.5 compatible).
+    Writes:
+      - Assistant JSON output to out_path
+      - Token usage sidecar to <out_path>.usage.json
     """
-    prompt_path = Path(prompt_path).resolve()
-    out_path = Path(out_path).resolve()
+
+    prompt_path = Path(prompt_path)
+    out_path = Path(out_path)
+    # Don't resolve out_path - it may not exist yet
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_TOKEN")
@@ -41,26 +32,17 @@ def run_openai_json(prompt_path: Path, out_path: Path, *, model: str, api_base: 
         return False, "missing OPENAI_API_KEY"
 
     base = (api_base or "https://api.openai.com/v1").rstrip("/")
-    url = f"{base}/chat/completions"
+    url = base + "/chat/completions"
 
     prompt = _read_text(prompt_path)
     if not prompt.strip():
         return False, "empty prompt"
 
-    # System instruction: JSON-only; no code fences, no prose
     system_msg = (
-        "You are a code generator that must output ONLY a single JSON object with no code fences and no prose. "
-        "Do not add explanations or extra text before or after the JSON."
+        "You are a code generator that must output ONLY a single JSON object "
+        "with no code fences and no prose."
     )
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # Some providers support response_format={"type":"json_object"} (OpenAI JSON mode).
-    # We include it opportunistically; providers that don't support it should ignore or error
-    # and RF4 will surface that message.
     payload = {
         "model": model,
         "messages": [
@@ -68,40 +50,94 @@ def run_openai_json(prompt_path: Path, out_path: Path, *, model: str, api_base: 
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.2,
+        "response_format": {"type": "json_object"},
     }
 
-    # Try to enable JSON mode if provider supports it
-    try:
-        payload["response_format"] = {"type": "json_object"}
-    except Exception:
-        pass
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+    }
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
+            resp = urllib.request.urlopen(req, timeout=180)
+            data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            snippet = ""
+            try:
+                snippet = e.read().decode("utf-8")[:400]
+            except Exception:
+                pass
+            if e.code == 429:  # Rate limited
+                last_error = "rate limited (attempt " + str(attempt+1) + "/" + str(max_retries) + ")"
+                print("Warning: " + last_error)
+                if attempt < max_retries - 1:
+                    wait_time = 30
+                    print("Waiting " + str(wait_time) + " seconds for rate limit...")
+                    time.sleep(wait_time)
+                    continue
+            return False, "http " + str(e.code) + ": " + snippet
+        except urllib.error.URLError as e:
+            last_error = "connection error (attempt " + str(attempt+1) + "/" + str(max_retries) + "): " + str(e.reason)
+            print("Warning: " + last_error)
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5
+                print("Retrying in " + str(wait_time) + " seconds...")
+                time.sleep(wait_time)
+                continue
+            return False, last_error
+        except Exception as e:
+            return False, "request failed: " + str(e)
+
+        break  # Success
 
     try:
-        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
-    except Exception as e:
-        return False, f"request failed: {e}"
-
-    if resp.status_code // 100 != 2:
-        # Include a small snippet of resp.text for debugging
-        snippet = (resp.text or "")[:400]
-        return False, f"http {resp.status_code}: {snippet}"
-
-    try:
-        data = resp.json()
         content = (
             data.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-    except Exception as e:
-        return False, f"invalid response JSON: {e}"
+    except Exception:
+        content = ""
 
     if not content or not isinstance(content, str):
         return False, "empty assistant content"
 
+    # ---- Extract token usage safely ----
+    usage = data.get("usage") if isinstance(data, dict) else {}
+
+    prompt_tokens = int(usage.get("prompt_tokens", 0)) if usage else 0
+    completion_tokens = int(usage.get("completion_tokens", 0)) if usage else 0
+    total_tokens = int(usage.get("total_tokens", 0)) if usage else (prompt_tokens + completion_tokens)
+
+    usage_meta = {
+        "model": data.get("model") or model,
+        "id": data.get("id"),
+        "created": data.get("created"),
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+    # Always write usage file (even if zeros)
     try:
-        out_path.write_text(content, encoding="utf-8")
+        usage_path = out_path.with_name(out_path.name + ".usage.json")
+        usage_path.write_text(json.dumps(usage_meta, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # never fail generation due to usage writing
+
+    try:
+        out_path.write_text(content.strip(), encoding="utf-8")
     except Exception as e:
-        return False, f"failed to write out_spec: {e}"
+        return False, "failed to write out_spec: " + str(e)
 
     return True, "ok"

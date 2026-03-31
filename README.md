@@ -1,96 +1,286 @@
-ReachForge4 (self-contained CI bundle)
+# ReachForge
 
-Overview
-- Purpose: Generate a single-shot fuzz driver (DriverSpec -> driver source -> binary) and 10 seeds (SeedsSpec) for a given C/C++ project rooted at --root.
-- This folder contains everything needed to run RF4 in a pipeline without depending on modules outside reachforge4/.
+LLM-powered fuzzing harness generator for C/C++ library vulnerabilities.
+Automatically generates targeted fuzz harnesses and seed inputs using LLVM IR
+call-graph analysis and LLM assistance within OSS-Fuzz containers.
 
-What’s bundled here
-- Core:
-  - cli.py: main entrypoint (python3 -m reachforge4.cli main2fuzz ...)
-  - generator.py, compiler.py, schema.py, source_index.py
-  - prompt_main2fuzz.py, prompt_seeds.py, poller_index.py
-  - llm_runner.py (prefers internal LLM adapter, falls back to legacy if present)
-- Config:
-  - config/llm.json: default model/api config (override via CLI/env)
-  - config/compile_command.py: compile command templates (bundled template used by default)
-- LLM adapter (internal):
-  - llm_adapters/openai.py: minimal JSON-only chat wrapper via requests
-  - llm_adapters/__init__.py
-- Requirements:
-  - requirements.txt: only requests is needed for LLM HTTP calls
+---
 
-External expectations (CI image/job)
-- Toolchain:
-  - AFL++ compilers (afl-clang-fast / afl-clang-fast++) or adjust compile_command.py to your compiler/sanitizers.
-  - Any app-specific headers/libs referenced in compile_command.py (e.g., build/vcpkg_installed/... paths).
-- Environment variables:
-  - OPENAI_API_KEY (or OPENAI_API_TOKEN) for the internal LLM adapter.
-  - Optional: REACHFORGE2_MAX_ROUNDS (e.g., 8–12 for complex projects).
-- Python:
-  - Python 3.10+ recommended
-  - pip install -r reachforge4/requirements.txt
+## Architecture
 
-Running in CI (example steps)
-1) Install deps
-   - pip install -r reachforge4/requirements.txt
-   - Ensure AFL++ and your app’s libs/headers are available on PATH and filesystem.
-2) Configure model (either):
-   - Set environment: export OPENAI_API_KEY=...
-   - Or edit reachforge4/config/llm.json (driver/seeds/default model/api_base).
-3) Run for an application (examples):
-   - Analyze Image:
-     python3 -m reachforge4.cli main2fuzz --root analyze-image
-   - MQTT server:
-     python3 -m reachforge4.cli main2fuzz --root mqtt-server
-4) Outputs:
-   - <root>/reachforge2_out/
-     - context/prompt.main2fuzz.md (and prompt.seeds.md)
-     - specs/driver_spec.json
-     - drivers/<app>/<driver_filename>
-     - compile.log.txt
-     - seeds/spec.json and seeds/<app>/[10 seed files] (by default unless disabled)
+```
+vulnerabilities.json + library source
+         │
+         ▼
+┌──────────────────┐
+│  build_capture    │  Intercepts compiler commands, generates LLVM IR
+│  rf-cc / rf-cxx   │  (ASAN + UBSAN + fuzzer-no-link instrumentation)
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│  harness_plan     │  LLVM IR callgraph → BFS from sink to public API
+│                    │  vuln_analyzer + contract_inference + stage_retrieval
+│                    │  Selects entry point, extracts parameter roles,
+│                    │  builds execution/trigger/construction plans
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│  prompt_harness   │  Builds structured LLM prompt with:
+│                    │  - CWE-specific guidance
+│                    │  - Call-path semantic analysis
+│                    │  - CVE description (if provided)
+│                    │  - Forbidden patterns
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│  LLM (OpenAI)    │  3 prompt variants → best candidate selection
+│                    │  gpt-5.4, temperature=0.2, JSON response
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│  harness_runner   │  ORCHESTRATOR — the main entry point
+│                    │  validate → repair → compile → seed → fuzz
+│                    │  Up to 3 repair attempts per failure mode:
+│                    │    semantic fix → compile fix → runtime fix
+└──────────────────┘
+         │
+    ┌────┼────────┐
+    ▼    ▼        ▼
+ compile  seed    fuzz
+ harness  gen     runner
+```
 
-CLI flags (subset)
-- --root <path>: application root containing app/src or src (required).
-- --out <path>: output directory (default: <root>/reachforge2_out).
-- --workdir <path>: working directory for compile commands (default: root).
-- Driver agent model:
-  - --driver-model, --driver-api-base (override config/env)
-- Seeds agent model:
-  - --seeds-model, --seeds-api-base (override config/env)
-- Vulnerabilities:
-  - --include-vulns (default on) / --no-include-vulns
-- Seed generation:
-  - --generate-seeds (default on) / --no-generate-seeds
-- Retry attempts on compile failure:
-  - --max-attempts N (default 2)
+**Entry point**: `python3 harness_runner.py`
 
-How model/config resolution works
-- Priority for model/api_base per agent:
-  1) CLI flags
-  2) Env vars: REACHFORGE4_DRIVER_MODEL / REACHFORGE4_DRIVER_API_BASE (seeds equivalents), or legacy REACHFORGE2_MODEL / REACHFORGE2_API_BASE
-  3) reachforge4/config/llm.json (driver / seeds / default sections)
+All other pipeline files are invoked by `harness_runner.py` via subprocess
+calls or direct imports. There is no separate CLI; `harness_runner.py` IS
+the CLI.
 
-Compile command template resolution
-- compiler.py prefers the bundled:
-  - reachforge4/config/compile_command.py
-- Legacy fallback:
-  - ReachForge/config/compile_command.py (if present)
-- Edit the bundled template to match your CI paths (include/lib/toolchain choices). Placeholders:
-  {src} {binary} {harness_dir} {name} {lang} {cmake_snippet} {out_dir} {workdir}
+---
 
-Poller and vulnerabilities (optional)
-- If <root>/poller/poller.py or sample inputs exist, RF4 summarizes them to bias realistic harness/seed choices (HTTP/multipart/MQTT patterns).
-- If vulnerabilities.json exists (root or app/), RF4 biases toward impacted files/functions.
+## Quick Start
 
-Notes
-- The driver generation is source-first and single-shot: no sockets/servers/threads/RNG/time.
-- RF4 can auto-add extra_sources based on undefined symbols and lift helper functions from the entry translation unit if needed.
+```bash
+# 1. Start an OSS-Fuzz container with the target library
+docker run -it --rm \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -v /path/to/ReachForge_tailored:/src/reachforge \
+  gcr.io/oss-fuzz/<library> \
+  /bin/bash
 
-Troubleshooting
-- “missing LLM adapter”: Set OPENAI_API_KEY and ensure requests is installed, or provide an external --llm-cmd.
-- “exhausted retrieval rounds without valid JSON”: Ensure OPENAI_API_KEY is set; optionally raise REACHFORGE2_MAX_ROUNDS (e.g., 8–12) or pass a different model via CLI.
-- Compile path issues: Adjust reachforge4/config/compile_command.py include/lib paths for your CI environment.
+# 2. Inside the container, run the pipeline
+python3 /src/reachforge/harness_runner.py \
+  --root /src/<library> \
+  --vulns /src/<library>/vulnerabilities.json \
+  --cve-id CVE-XXXX-XXXXX \
+  --out /out/reachforge
+```
 
-License
-- This folder contains only the RF4 tooling and configs. Your app code and third-party libs remain under their respective licenses.
+### Example: libpng
+
+```bash
+docker run -it --rm \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -v ~/ReachForge_tailored:/src/reachforge \
+  gcr.io/oss-fuzz/libpng \
+  python3 /src/reachforge/harness_runner.py \
+    --root /src/libpng \
+    --vulns /src/libpng/vulnerabilities.json \
+    --cve-id CVE-2025-64505 \
+    --out /out/reachforge
+```
+
+---
+
+## Requirements
+
+- Python 3.8+
+- libclang (available in OSS-Fuzz containers)
+- OpenAI API key (set as `OPENAI_API_KEY` environment variable)
+- Docker with pre-built OSS-Fuzz images
+
+### Available Docker Images
+
+cjson, curl, expat, harfbuzz, libarchive, libpng, libtiff, libwebp,
+libxml2, sqlite3, zlib
+
+---
+
+## vulnerabilities.json Format
+
+Each target library needs a `vulnerabilities.json` file:
+
+```json
+{
+  "vulnerabilities": [
+    {
+      "cve-id": "CVE-2025-64505",
+      "package-name": "libpng",
+      "package-version": "1.6.50",
+      "cwe-id": "CWE-125",
+      "affected-file": "pngrtran.c",
+      "affected-function": "png_do_quantize",
+      "description": "Optional: CVE advisory text for better LLM guidance"
+    }
+  ]
+}
+```
+
+**Required fields**: `cve-id`, `package-name`, `affected-function`, `cwe-id`
+**Optional fields**: `description` (improves harness quality significantly),
+`package-version`, `affected-file`
+
+---
+
+## Configuration
+
+### LLM (`config/llm.json`)
+
+```json
+{
+  "default": { "model": "gpt-5.4", "api_base": "https://api.openai.com/v1" },
+  "driver":  { "model": "gpt-5.4", "api_base": "https://api.openai.com/v1" },
+  "seeds":   { "model": "gpt-5.4", "api_base": "https://api.openai.com/v1" }
+}
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | OpenAI API key (required) |
+| `LIB_FUZZING_ENGINE` | Path to fuzzer runtime library (set by OSS-Fuzz) |
+
+---
+
+## Pipeline Steps (what harness_runner.py does)
+
+1. **Build Capture** — Runs the library's build system with `rf-cc`/`rf-cxx` as
+   CC/CXX, logging compile commands to JSONL and generating LLVM IR (`.ll` files)
+   with ASAN/UBSAN/fuzzer-no-link instrumentation.
+
+2. **Harness Planning** — Builds an LLVM IR callgraph (including indirect calls
+   via function pointer dispatch tables), finds all public APIs that reach the
+   vulnerable function via BFS, selects the best entry point using taint-based
+   scoring, and produces a detailed plan with parameter roles, execution hints,
+   trigger conditions, and construction plans.
+
+3. **Prompt Building** — Constructs a structured LLM prompt with CWE-specific
+   test patterns, call-path semantic analysis, annotated source snippets,
+   contract obligations, and forbidden anti-patterns.
+
+4. **LLM Harness Generation** — Sends 3 prompt variants to the LLM (temperature
+   0.2), validates each candidate statically (100-point scoring with ~20 check
+   categories), selects the best one.
+
+5. **Compilation** — Compiles the harness against the instrumented library,
+   auto-detects extra link libraries (zlib, lzma, etc.) via `nm --undefined-only`.
+
+6. **Repair Loop** — Up to 3 attempts per failure mode:
+   - Semantic validation failure → LLM fix prompt with specific violations
+   - Compile failure → LLM fix prompt with compiler errors
+   - Runtime smoke failure → LLM fix prompt with crash/timeout info
+
+7. **Seed Generation** — LLM generates targeted seed inputs based on the
+   vulnerability type, function source, and CWE guidance.
+
+8. **Fuzzing** — Runs the compiled harness with the generated seed corpus.
+
+---
+
+## Project Structure
+
+```
+ReachForge_tailored/
+├── harness_runner.py      # Entry point — end-to-end orchestrator (733 lines)
+│
+├── build_capture.py       # Build interception, sets CC/CXX to rf-cc/rf-cxx (94)
+├── harness_plan.py        # Callgraph BFS, parameter roles, planning (2385)
+├── prompt_harness.py      # LLM prompt builder with CWE guidance (886)
+├── compile_harness.py     # Harness compilation, auto link-lib detection (825)
+├── harness_validator.py   # Static validation + runtime smoke tests (1011)
+├── seed_generator.py      # Seed generation via LLM (256)
+├── fuzz_runner.py         # Seed corpus creation and fuzzer execution (325)
+│
+├── llvm_callgraph.py      # LLVM IR callgraph with function pointer resolution (868)
+├── public_api.py          # libclang-based public API extraction (756)
+├── vuln_analyzer.py       # Sink analysis: params, state, conditions, roles (2238)
+├── contract_inference.py  # Semantic contract recovery (507)
+├── stage_retrieval.py     # Source snippet retrieval for deferred stages (370)
+│
+├── rf-cc                  # C compiler wrapper (instrumentation + IR)
+├── rf-cxx                 # C++ compiler wrapper (instrumentation + IR)
+├── vulnerabilities.json   # CVE definitions for target libraries
+├── Dockerfile.ci          # CI container definition
+├── requirements.txt       # Python dependencies
+├── __init__.py            # Package marker
+│
+├── config/
+│   └── llm.json           # LLM model and API configuration
+├── llm_adapters/
+│   ├── __init__.py
+│   └── openai.py          # Raw urllib OpenAI wrapper with retry logic (142)
+├── tests/                 # 78 tests across 5 files (2811 lines)
+│   ├── conftest.py
+│   ├── test_harness_runner.py
+│   ├── test_llvm_callgraph_context.py
+│   ├── test_contract_inference.py
+│   ├── test_setup_state_ranking.py
+│   └── test_vuln_analyzer_semantics.py
+└── oss-fuzz/              # OSS-Fuzz project definitions (used for Docker builds)
+```
+
+**Total**: ~11,400 lines of pipeline code, ~2,800 lines of tests, 78 tests passing.
+
+---
+
+## Running Tests
+
+```bash
+cd /path/to/ReachForge_tailored
+python3 -m pytest tests/ -v
+```
+
+---
+
+## Key Design Decisions
+
+- **LLVM IR over AST**: Callgraph built from `.ll` files, not source AST. This
+  resolves indirect calls through function pointer dispatch tables (struct field
+  GEP tracking) and handles all compiler-resolved overloads.
+
+- **3-variant prompting**: Three prompt variants sent to LLM with different
+  emphasis; best candidate selected by static validation score.
+
+- **100-point validation**: ~20 check categories including: correct includes,
+  no forbidden patterns (threads, sockets, RNG), proper memory management,
+  stdin/file reading patterns, fuzz target signature, etc.
+
+- **Runtime smoke test**: Compiled harness run with 3 probe files, -runs=3,
+  timeout=20s. Evidence classification: sink-hit (100), sink-adjacent (80),
+  entry-reached (50).
+
+- **Auto link-lib detection**: `nm --undefined-only` on the compiled object,
+  pattern-matched against known libraries (zlib via deflate/inflate, lzma via
+  lzma_* prefixes, etc.).
+
+- **No hardcoded patterns**: Everything derived from static analysis of the
+  actual library source and LLVM IR. CWE guidance is generic, not library-specific.
+
+---
+
+## Known Limitations
+
+- **Local-only sink analysis**: `vuln_analyzer.py` reads only the sink function
+  body. It cannot trace how parameters are derived from callers (no inter-function
+  data flow).
+
+- **Build system auto-detection**: Supports cmake and autotools. Other build
+  systems need `--build-script`.
+
+- **Model dependency**: Uses raw `urllib` to call OpenAI API (no SDK). Rate
+  limit retry: fixed 30s wait. Connection error retry: linear backoff.
+
+- **No automatic CVE description lookup**: The `description` field in
+  vulnerabilities.json must be manually added but significantly improves
+  harness quality.
