@@ -12,6 +12,9 @@ This is completely generic - no library-specific knowledge required.
 """
 import re
 import json
+import hashlib
+import tempfile
+import sys
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -408,12 +411,17 @@ def classify_parameter_role(param_name: str, param_type: str) -> Dict[str, str]:
             'role': 'control',
             'strategy': 'map a few fuzzer bits to valid enum or flag values to explore alternate branches'
         }
-    if any(token in name for token in ['out', 'dst', 'dest', 'result', 'output']):
+    if any(token in name for token in ['out', 'dst', 'dest', 'result', 'output', 'return']):
         return {
             'role': 'output-buffer',
             'strategy': 'allocate a bounded writable buffer owned by the harness before the call'
         }
-    if any(token in name for token in ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'info', 'strm']) or (name.endswith('_ptr') and not any(token in name for token in ['buf', 'data', 'text', 'str'])) or '%struct' in type_name:
+    if '**' in type_name:
+        return {
+            'role': 'output-buffer',
+            'strategy': 'allocate a bounded writable buffer owned by the harness before the call'
+        }
+    if any(token in name for token in ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'info', 'strm']) or (name.endswith('_ptr') and not any(token in name for token in ['buf', 'data', 'text', 'str'])) or '%struct' in type_name or (type_name.endswith('ptr') and '*' not in type_name):
         return {
             'role': 'state',
             'strategy': 'create or initialize a valid state object before invoking the target API'
@@ -1593,6 +1601,91 @@ def extract_function_source(source_file: Path, function_name: str, context_lines
     return ""
 
 
+def extract_smart_excerpt(source_file, function_name, max_chars=2000):
+    """Extract a compact excerpt: signature + key control-flow lines.
+
+    Returns at most *max_chars* characters.  The excerpt prioritises the
+    function signature, early branching/dispatch, and any lines that
+    reference common vulnerability patterns (free, alloc, bounds, etc.).
+    """
+    try:
+        if hasattr(source_file, 'read_text'):
+            content = source_file.read_text(encoding="utf-8", errors="ignore")
+        else:
+            content = open(str(source_file), 'r', encoding='utf-8', errors='ignore').read()
+    except Exception:
+        return ""
+
+    span = _find_function_definition_span(content, function_name)
+    if not span:
+        # Fall back to regex-based extraction
+        lines = content.splitlines()
+        pat = re.compile(r'\b' + re.escape(function_name) + r'\b\s*\(')
+        for i, line in enumerate(lines):
+            if pat.search(line):
+                start = max(0, i - 2)
+                end = min(len(lines), i + 40)
+                return '\n'.join(lines[start:end])[:max_chars]
+        return ""
+
+    func_text = content[span[0]:span[1]]
+    if len(func_text) <= max_chars:
+        return func_text
+
+    lines = func_text.splitlines()
+    # Always keep signature (first few lines until opening brace)
+    sig_end = 0
+    for idx, ln in enumerate(lines):
+        sig_end = idx
+        if '{' in ln:
+            break
+    sig_lines = lines[:sig_end + 1]
+
+    # Score remaining lines by importance
+    important_re = re.compile(
+        r'\b(if|switch|case|for|while|return|goto|free|realloc|malloc|calloc|'
+        r'memcpy|memmove|assert|sizeof|NULL|break)\b|->|&&|\|\|',
+        re.IGNORECASE,
+    )
+    scored = []
+    for idx, ln in enumerate(lines[sig_end + 1:], start=sig_end + 1):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        s = 1
+        if important_re.search(stripped):
+            s += 3
+        # Bonus for lines referencing other functions (call sites)
+        if re.search(r'\b[a-zA-Z_]\w*\s*\(', stripped) and not stripped.startswith('//'):
+            s += 2
+        scored.append((s, idx, ln))
+
+    scored.sort(key=lambda x: -x[0])
+
+    # Greedily pick lines in original order until budget
+    budget = max_chars - sum(len(l) + 1 for l in sig_lines)
+    picked_indices = set()
+    for _s, idx, ln in scored:
+        cost = len(ln) + 1
+        if cost > budget:
+            continue
+        picked_indices.add(idx)
+        budget -= cost
+        if budget <= 0:
+            break
+
+    result_lines = list(sig_lines)
+    prev_idx = sig_end
+    for idx in sorted(picked_indices):
+        if idx > prev_idx + 1:
+            result_lines.append('    // ...')
+        result_lines.append(lines[idx])
+        prev_idx = idx
+    result_lines.append('}')
+
+    return '\n'.join(result_lines)[:max_chars]
+
+
 def extract_parameter_conditions(source_code: str, param_names: List[str]) -> List[Dict]:
     """
     Extract conditions involving parameters.
@@ -1890,6 +1983,198 @@ def extract_constants_and_enums(source_code: str) -> Dict[str, Any]:
     return constants
 
 
+# ─────────── LLM-based sink analysis (replaces heuristic classifiers) ───────────
+
+def _load_llm_config():
+    """Load model and API base from config/llm.json."""
+    cfg_path = Path(__file__).resolve().parent / "config" / "llm.json"
+    model = "gpt-4o"
+    api_base = "https://api.openai.com/v1"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        model = cfg.get("default", {}).get("model") or model
+        api_base = cfg.get("default", {}).get("api_base") or api_base
+    except Exception:
+        pass
+    return model, api_base
+
+
+def llm_classify_sink_analysis(function_name, source_code, parameter_roles,
+                               helper_calls=None, state_fields=None,
+                               cache_dir=None):
+    """Use the LLM to classify vulnerability context from the sink function.
+
+    Replaces the heuristic classification chain (build_input_model,
+    infer_sensitive_controls, infer_workload_model, infer_required_support_objects,
+    infer_milestone_hints) with a single LLM call that reads the source and
+    produces semantic classifications.
+
+    Returns a dict with any subset of:
+      - input_model
+      - sensitive_controls
+      - workload_model
+      - required_support_objects
+      - milestone_hints
+    Returns {} on failure.
+    """
+    try:
+        from llm_adapters.openai import run_openai_json
+    except ImportError:
+        return {}
+
+    import os
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_TOKEN")):
+        return {}
+
+    model, api_base = _load_llm_config()
+
+    # Build concise parameter list
+    param_list = '\n'.join(
+        '- {} ({}) [role: {}]'.format(
+            p.get('name', '?'), p.get('type', '?'), p.get('role', '?'))
+        for p in (parameter_roles or [])[:15]
+    )
+
+    helper_text = ''
+    if helper_calls:
+        helper_text = '\nHELPER FUNCTIONS called nearby:\n' + '\n'.join(
+            '- {} [phase: {}]'.format(h.get('name', '?'), h.get('phase', '?'))
+            for h in helper_calls[:15]
+        )
+
+    state_text = ''
+    if state_fields:
+        state_text = '\nSTATE FIELDS accessed:\n' + '\n'.join(
+            '- {}.{} [kind: {}]'.format(
+                f.get('owner', '?'), f.get('field', '?'), f.get('kind', '?'))
+            for f in state_fields[:15]
+        )
+
+    prompt = """You are a vulnerability researcher analyzing a C/C++ function to determine how a fuzz harness should be constructed. Your analysis must be SPECIFIC to this function - avoid generic boilerplate.
+
+FUNCTION: {name}
+
+SOURCE CODE:
+```c
+{source}
+```
+
+PARAMETERS (heuristic classification - may be wrong):
+{params}
+{helpers}{state}
+
+Analyze the source code and determine:
+1. What kind of input does the calling chain ultimately process? Look at types used (XML_Char, png_byte, z_stream, etc.), function names called, struct fields, and data flow patterns.
+2. Which parameters actually matter for reaching vulnerable code? ONLY include parameters the caller controls, NOT internal struct fields.
+3. What libraries/objects must be set up before this function is reachable?
+4. What processing model does the code follow?
+5. What milestones must be reached for this code path to be exercised?
+
+Return a JSON object:
+{{
+  "input_model": {{
+    "primary": "structured-format" or "raw-buffer" or "semantic-arguments",
+    "format_type": "XML" or "JSON" or "PNG" or "TIFF" or "ZIP" or "gzip" or "unknown",
+    "secondary": ["from: magic-or-container-header, mode-selection, stateful-object, direct-api-arguments, streaming-or-incremental, numeric-controls, parser-lifecycle, post-parse-work-units"],
+    "evidence": ["1-2 sentence reasons for your classification"]
+  }},
+  "sensitive_controls": [
+    {{"target": "name", "source_kind": "parameter" or "field", "score": 1, "reasons": ["why this matters for trigger"]}}
+  ],
+  "workload_model": {{
+    "operators": ["from: repeated-records, chunked-stream, control-biased, bounded-buffer, structured-container, direct-buffer"],
+    "evidence": ["reasons"]
+  }},
+  "required_support_objects": [
+    {{"name": "object_name", "kind": "type", "reason": "why needed before this function runs"}}
+  ],
+  "milestone_hints": [
+    {{"name": "milestone_name", "kind": "category", "reason": "why needed", "harness_expectation": "what the harness should do"}}
+  ]
+}}
+
+IMPORTANT:
+- For input_model, look at what DATA the function processes (XML elements? image rows? raw bytes?) to determine the format, not just parameter types.
+- For sensitive_controls, only include parameters visible to the PUBLIC caller. Internal struct state like parser->m_encoding or state->mode are NOT caller-controllable.
+- For required_support_objects, only include objects the caller must explicitly create. Do NOT include internal allocations the library manages.
+- For milestone_hints, only include milestones that are SPECIFIC to this code path. Do not include generic lifecycle milestones.""".format(
+        name=function_name,
+        source=source_code[:4000],
+        params=param_list,
+        helpers=helper_text,
+        state=state_text,
+    )
+
+    # Cache check
+    cache_file = None
+    if cache_dir:
+        cache_dir = Path(cache_dir)
+        key = hashlib.sha256(
+            (function_name + source_code[:2000]).encode()
+        ).hexdigest()[:16]
+        cache_file = cache_dir / 'llm_sink_analysis_{}.json'.format(key)
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                if cached.get('input_model'):
+                    print("[llm_sink_analysis] Using cached analysis for {}".format(
+                        function_name))
+                    return cached
+            except Exception:
+                pass
+
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="rf_sink_analysis_"))
+        prompt_file = tmp_dir / "prompt_sink_analysis.md"
+        out_file = tmp_dir / "response.json"
+        prompt_file.write_text(prompt, encoding="utf-8")
+
+        ok, msg = run_openai_json(
+            prompt_path=prompt_file,
+            out_path=out_file,
+            model=model,
+            api_base=api_base,
+            max_retries=2,
+        )
+        if not ok:
+            print("[llm_sink_analysis] LLM call failed: {}".format(msg),
+                  file=sys.stderr)
+            return {}
+
+        result = json.loads(out_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print("[llm_sink_analysis] Error: {}".format(exc), file=sys.stderr)
+        return {}
+
+    # Validate and extract
+    analysis = {}
+    if 'input_model' in result and isinstance(result['input_model'], dict):
+        im = result['input_model']
+        if im.get('primary') in ('structured-format', 'raw-buffer', 'semantic-arguments'):
+            analysis['input_model'] = im
+    if 'sensitive_controls' in result and isinstance(result['sensitive_controls'], list):
+        analysis['sensitive_controls'] = result['sensitive_controls'][:10]
+    if 'workload_model' in result and isinstance(result['workload_model'], dict):
+        analysis['workload_model'] = result['workload_model']
+    if 'required_support_objects' in result and isinstance(result['required_support_objects'], list):
+        analysis['required_support_objects'] = result['required_support_objects'][:6]
+    if 'milestone_hints' in result and isinstance(result['milestone_hints'], list):
+        analysis['milestone_hints'] = result['milestone_hints'][:8]
+
+    # Cache
+    if cache_file and analysis:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    print("[llm_sink_analysis] LLM classified {} - input_model: {}".format(
+        function_name,
+        analysis.get('input_model', {}).get('primary', '?')))
+    return analysis
+
+
 def analyze_vulnerable_function(source_file: Path, function_name: str, debug: bool = True) -> Dict[str, Any]:
     """
     Main entry point: analyze a vulnerable function and extract insights.
@@ -2048,7 +2333,32 @@ def analyze_vulnerable_function(source_file: Path, function_name: str, debug: bo
         'sink_live_predicates': sink_live_predicates,
         'active_data_plan': active_data_plan,
     }
-    
+
+    # ── LLM-based classification override ──
+    # The heuristic classifiers above use keyword-matching which produces
+    # frequent misclassifications (e.g. raw-buffer for XML parsers, lookup-
+    # table false positives, sink-internal params in sensitive_controls).
+    # Ask the LLM to re-classify from the source code and override when it
+    # produces a valid result.
+    llm_overrides = llm_classify_sink_analysis(
+        function_name,
+        source_code,
+        parameter_roles,
+        helper_calls=helper_calls,
+        state_fields=state_fields,
+        cache_dir=None,
+    )
+    _LLM_OVERRIDE_KEYS = [
+        'input_model', 'sensitive_controls', 'workload_model',
+        'required_support_objects', 'milestone_hints',
+    ]
+    if llm_overrides:
+        for key in _LLM_OVERRIDE_KEYS:
+            if key in llm_overrides:
+                analysis[key] = llm_overrides[key]
+                if debug:
+                    print("[DEBUG] vuln_analyzer: LLM override for {}".format(key))
+
     # Generate human-readable insights
     analysis['insights'] = generate_insights(analysis)
     

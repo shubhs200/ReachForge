@@ -228,6 +228,8 @@ def find_library_in_project(project_root):
     
     Returns a dict with library info, or None if not found.
     Searches for: .a (static), .so (shared)
+    Recurses into subdirectories (up to 4 levels) to handle projects
+    like expat where libs live at /src/expat/expat/lib/.libs/.
     """
     import glob
     
@@ -245,6 +247,21 @@ def find_library_in_project(project_root):
         os.path.join(project_root, 'build'),  # CMake build dir
     ]
     
+    # Also recurse to find .libs directories deeper in the tree
+    # (e.g. /src/expat/expat/lib/.libs/)
+    try:
+        for root_d, dirs, _files in os.walk(project_root):
+            depth = root_d[len(project_root):].count(os.sep)
+            if depth > 4:
+                dirs.clear()
+                continue
+            basename = os.path.basename(root_d)
+            if basename == '.libs' or basename == 'build':
+                if root_d not in search_dirs:
+                    search_dirs.append(root_d)
+    except OSError:
+        pass
+
     for search_dir in search_dirs:
         if not os.path.exists(search_dir):
             continue

@@ -6,6 +6,13 @@ import sys
 import re
 from pathlib import Path
 
+# Parser/decoder entry function pattern — used to simplify parameter strategies
+# when the entry function is a one-shot parser that naturally accepts data+size.
+_PARSER_ENTRY_RE = re.compile(
+    r'(?:parse|read|decode|load|deserialize|from_?(?:string|buffer|data|bytes|json|xml|yaml|cbor|msgpack))',
+    re.IGNORECASE,
+)
+
 # Try to set libclang path before importing
 try:
     # Try common libclang locations
@@ -32,7 +39,7 @@ from public_api import (
     find_shared_libraries,
     extract_exported_symbols_from_library
 )
-from llvm_callgraph import build_callgraph_from_build_log, find_public_wrapper, find_ll_files, score_path_taint
+from llvm_callgraph import build_callgraph_from_build_log, find_public_wrapper, find_ll_files, score_path_taint, trace_parameter_flow
 from stage_retrieval import retrieve_stage_evidence
 from vuln_analyzer import analyze_vulnerable_function
 
@@ -40,7 +47,7 @@ from vuln_analyzer import analyze_vulnerable_function
 SEMANTIC_STOP_TOKENS = set([
     'api', 'arg', 'args', 'call', 'ctx', 'data', 'entry', 'fn', 'func', 'function',
     'get', 'handle', 'info', 'init', 'invoke', 'obj', 'object', 'out', 'param',
-    'parser', 'png', 'ptr', 'read', 'set', 'state', 'stream', 'struct', 'target',
+    'parser', 'ptr', 'read', 'set', 'state', 'stream', 'struct', 'target',
     'type', 'write'
 ])
 
@@ -104,16 +111,19 @@ def build_parameter_roles_from_signature(signature_params):
         elif any(token in lowered_name for token in ['mode', 'type', 'flag', 'flags', 'option', 'options', 'kind', 'op', 'cmd', 'flush']):
             role = 'control'
             strategy = 'map a few fuzzer bits to valid enum or flag values to explore alternate branches'
-        elif any(token in lowered_name for token in ['out', 'dst', 'dest', 'result', 'output']):
+        elif any(token in lowered_name for token in ['out', 'dst', 'dest', 'result', 'output', 'return']):
             role = 'output-buffer'
             strategy = 'allocate a bounded writable buffer owned by the harness before the call'
-        elif any(token in lowered_name for token in ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'strm', 'info']) or (lowered_name.endswith('_ptr') and not any(token in lowered_name for token in ['buf', 'data', 'text', 'str'])) or '%struct' in lowered_type:
+        elif '**' in lowered_type:
+            role = 'output-buffer'
+            strategy = 'allocate a bounded writable buffer owned by the harness before the call'
+        elif any(token in lowered_name for token in ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'strm', 'info']) or (lowered_name.endswith('_ptr') and not any(token in lowered_name for token in ['buf', 'data', 'text', 'str'])) or '%struct' in lowered_type or (lowered_type.endswith('ptr') and '*' not in lowered_type):
             role = 'state'
             strategy = 'create or initialize a valid state object before invoking the target API'
         elif any(token in lowered_name for token in ['table', 'array', 'list', 'entry', 'entries', 'palette', 'hist', 'map']) or any(token in lowered_type for token in ['table', 'array', 'list', 'palette', 'hist']):
             role = 'support-buffer'
             strategy = 'allocate a bounded typed buffer or table and populate it from fuzz-controlled values while preserving count consistency'
-        elif '*' in lowered_type or 'char' in lowered_type or 'void' in lowered_type or 'bytef' in lowered_type:
+        elif '*' in lowered_type or 'char' in lowered_type or 'void' in lowered_type or 'byte' in lowered_type:
             role = 'input-buffer'
             strategy = 'back with fuzz-controlled bytes, preserving required alignment or termination rules'
         elif any(token in lowered_type for token in ['int', 'long', 'short', 'size_t', 'ssize_t', 'uint', 'float', 'double']):
@@ -669,7 +679,7 @@ def normalize_vuln_context(vuln_context, public_api_name, public_signatures):
     input_model = dict(context.get('input_model', {}))
     if input_model.get('primary') == 'raw-buffer':
         has_input_buffer = any(item.get('role') == 'input-buffer' for item in resolved_roles)
-        has_semantic_args = any(item.get('role') in ['size', 'numeric', 'control', 'support-buffer'] for item in resolved_roles)
+        has_semantic_args = any(item.get('role') in ['size', 'numeric', 'control', 'support-buffer', 'state'] for item in resolved_roles)
         if not has_input_buffer and has_semantic_args:
             input_model['primary'] = 'semantic-arguments'
             secondary = list(input_model.get('secondary', []))
@@ -792,7 +802,7 @@ def _stage_from_text(text, path_traits, default_stage):
     lowered = (text or '').lower()
     entry_tokens = ['init', 'open', 'create', 'setup', 'begin', 'start', 'alloc']
     parse_tokens = ['head', 'header', 'chunk', 'signature', 'magic', 'container', 'prefix', 'record', 'frame', 'packet', 'section', 'metadata', 'parse', 'parser']
-    transform_tokens = ['transform', 'quant', 'quantize', 'palette', 'gamma', 'color', 'background', 'expand', 'convert', 'scale', 'lookup', 'hist', 'dither']
+    transform_tokens = ['transform', 'quant', 'quantize', 'convert', 'scale', 'expand', 'palette', 'lookup', 'hist']
 
     if any(token in lowered for token in parse_tokens):
         return 'parse'
@@ -1027,21 +1037,38 @@ def infer_public_lifecycle_candidates(public_api_name, public_api_names, phase_n
     suffixes_by_phase = {
         'setup': ['Init2_', 'Init_', 'Init2', 'Init', 'Open', 'Create', 'Setup', 'Begin', 'Start'],
         'update': ['Update', 'Write', 'Append', 'Push', 'Feed'],
-        'cleanup': ['End', 'Close', 'Destroy', 'Cleanup', 'Free'],
+        'cleanup': ['End', 'Close', 'Destroy', 'Cleanup', 'Free', 'Reset'],
     }
 
     base = normalize_lifecycle_base(public_api_name)
     exact_prefix = public_api_name
+    phase_suffixes = suffixes_by_phase.get(phase_name, [])
     matches = []
     for candidate in sorted(public_api_names):
         if candidate == public_api_name:
             continue
         if normalize_lifecycle_base(candidate) != base:
             continue
-        if not any(candidate.endswith(suffix) for suffix in suffixes_by_phase.get(phase_name, [])):
+        if not any(candidate.endswith(suffix) for suffix in phase_suffixes):
             continue
         if candidate.startswith(exact_prefix) or normalize_lifecycle_base(candidate) == base:
             matches.append(candidate)
+
+    # Substring fallback: when base-matching finds nothing, check if the
+    # public_api_name is a case-insensitive substring of the candidate AND
+    # the candidate ends with a lifecycle suffix for the phase.
+    # E.g. XML_Parse is a substring of XML_ParserCreate → match on 'setup'.
+    if not matches and phase_suffixes:
+        lowered_api = public_api_name.lower()
+        for candidate in sorted(public_api_names):
+            if candidate == public_api_name:
+                continue
+            if lowered_api not in candidate.lower():
+                continue
+            if not any(candidate.endswith(suffix) for suffix in phase_suffixes):
+                continue
+            matches.append(candidate)
+
     return matches[:8]
 
 
@@ -1197,60 +1224,31 @@ def build_input_segments(vuln_context):
 
 
 def build_trigger_plan(entry, public_api_name, execution_plan, vuln_context):
-    """Build a compact trigger-oriented plan that focuses on sink reachability."""
-    sink_role = vuln_context.get('sink_role', {})
-    failure_path_indicators = vuln_context.get('failure_path_indicators', {})
-    cleanup_preconditions = vuln_context.get('cleanup_preconditions', [])
-    ownership_transitions = vuln_context.get('ownership_transitions', [])
-    trigger_hints = vuln_context.get('trigger_hints', [])
+    """Build a compact trigger-oriented plan.
 
-    lifecycle_profiles = []
-    role_name = sink_role.get('role', 'invoke')
-    if role_name == 'cleanup':
-        lifecycle_profiles.append({
-            'name': 'success-then-cleanup',
-            'goal': 'populate valid internal state through the public API and then call the cleanup sink once'
-        })
-        lifecycle_profiles.append({
-            'name': 'partial-init-then-cleanup',
-            'goal': 'drive the object into a partially initialized or partially decoded state before invoking cleanup'
-        })
-        if failure_path_indicators.get('error_labels') or failure_path_indicators.get('return_checks'):
-            lifecycle_profiles.append({
-                'name': 'error-path-cleanup',
-                'goal': 'exercise cleanup after a public-API failure or bounded malformed input path'
-            })
-    else:
-        lifecycle_profiles.append({
+    Since the harness calls the public entry point (not the sink), this
+    returns a simple 'primary-invoke' lifecycle profile.  Sink-centric
+    cleanup roles, failure-path indicators, and ownership transitions are
+    intentionally omitted — they describe the sink function's internals.
+    """
+    lifecycle_profiles = [
+        {
             'name': 'primary-invoke',
             'goal': 'exercise the selected public API with valid setup and controlled workload shaping'
-        })
+        }
+    ]
 
     input_shaping = list(execution_plan.get('input_segments', []))[:4]
-    if role_name == 'cleanup' and execution_plan.get('input_model', {}).get('primary') == 'structured-format':
-        input_shaping.append({
-            'name': 'error-variant',
-            'source': 'selector bit or bounded malformed section',
-            'purpose': 'switch between a well-formed container and a partially invalid variant that still reaches cleanup'
-        })
-
-    failure_modes = []
-    if failure_path_indicators.get('error_labels'):
-        failure_modes.append('cleanup labels or error labels: {}'.format(', '.join(failure_path_indicators.get('error_labels', [])[:4])))
-    if failure_path_indicators.get('return_checks'):
-        failure_modes.append('guarded early returns: {}'.format('; '.join(failure_path_indicators.get('return_checks', [])[:3])))
-    if failure_path_indicators.get('error_calls'):
-        failure_modes.append('error-signaling helpers: {}'.format(', '.join(failure_path_indicators.get('error_calls', [])[:4])))
 
     return {
-        'sink_role': role_name,
-        'sink_role_evidence': sink_role.get('evidence', [])[:4],
-        'lifecycle_profiles': lifecycle_profiles[:3],
-        'cleanup_preconditions': cleanup_preconditions[:6],
-        'ownership_transitions': ownership_transitions[:6],
-        'failure_modes': failure_modes[:4],
+        'sink_role': 'invoke',
+        'sink_role_evidence': [],
+        'lifecycle_profiles': lifecycle_profiles,
+        'cleanup_preconditions': [],
+        'ownership_transitions': [],
+        'failure_modes': [],
         'input_shaping': input_shaping,
-        'trigger_hints': trigger_hints[:6],
+        'trigger_hints': [],
     }
 
 
@@ -1374,18 +1372,18 @@ def _has_header_registration_contract(vuln_context, public_api_name):
     required_setup_calls = vuln_context.get('required_setup_calls', [])
     activation_predicates = vuln_context.get('activation_predicates', [])
     support_object_construction = vuln_context.get('support_object_construction', [])
-    api_name = (public_api_name or '').lower()
 
     setup_names = {(item.get('name') or '').lower() for item in required_setup_calls}
     support_names = {(item.get('name') or '').lower() for item in support_object_construction}
     predicate_targets = ' '.join([(item.get('target') or '').lower() for item in activation_predicates])
 
-    if api_name.startswith('inflate') and 'inflategetheader' in setup_names:
+    # Generic: any setup call whose name mentions "header" implies a header contract.
+    if any('header' in name for name in setup_names):
         return True
-    if api_name.startswith('deflate') and 'deflatesetheader' in setup_names:
-        return True
+    # Generic: a support object named head/header with predicate targets mentioning
+    # header-related fields implies a header registration lifecycle.
     if 'head' in support_names or 'header' in support_names:
-        if any(token in predicate_targets for token in ['state->head', 'head->extra', 'head->name', 'head->comment', 'header->']):
+        if any(token in predicate_targets for token in ['head', 'header']):
             return True
     return False
 
@@ -1597,7 +1595,7 @@ def build_milestone_plan(public_api_name, path_names, input_model, workload_mode
             'Shape inputs so upstream parsing or decoding produces at least one concrete work unit before cleanup or return.',
         )
 
-    if path_traits.get('transform_like') or any(token in token_haystack for token in ['transform', 'quant', 'quantize', 'palette', 'gamma', 'color', 'background', 'expand', 'convert', 'scale']):
+    if path_traits.get('transform_like') or any(token in token_haystack for token in ['transform', 'quant', 'quantize', 'convert', 'scale', 'expand', 'palette', 'lookup', 'hist']):
         add(
             'transform-ready',
             'transform-gating',
@@ -1649,9 +1647,372 @@ def build_execution_sink_live_predicates(milestone_plan, vuln_context):
     return unique[:8]
 
 
+# ─────────── LLM-based execution strategy (replaces heuristic planning) ───────────
+
+def _load_llm_config():
+    """Load model and API base from config/llm.json."""
+    cfg_path = Path(__file__).resolve().parent / "config" / "llm.json"
+    model = "gpt-4o"
+    api_base = "https://api.openai.com/v1"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        model = cfg.get("default", {}).get("model") or model
+        api_base = cfg.get("default", {}).get("api_base") or api_base
+    except Exception:
+        pass
+    return model, api_base
+
+
+# ─────────── LLM-based entry-path selection ───────────
+
+def llm_select_entry_path(all_paths, sink_name, entry, public_signatures,
+                          cache_dir=None):
+    """Use the LLM to select the best entry-point path from BFS candidates.
+
+    The LLM receives all candidate paths together with vulnerability context
+    (CVE description, CWE, affected function) and function signatures for
+    each entry point.  It picks the path that gives the harness maximum
+    control over the state needed to trigger the specific vulnerability.
+
+    Returns the selected path (list of function names) or None on failure,
+    in which case the caller should fall back to heuristic scoring.
+    """
+    import hashlib
+    import tempfile
+
+    try:
+        from llm_adapters.openai import run_openai_json
+    except ImportError:
+        return None
+
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_TOKEN")):
+        return None
+
+    model, api_base = _load_llm_config()
+
+    # ── Build the prompt ──
+
+    cve_id = entry.get('cve-id', 'unknown')
+    description = entry.get('description', '')
+    cwe_id = entry.get('cwe-id', '')
+    affected_func = entry.get('affected-function', sink_name)
+
+    # Format each candidate path with its entry-function signature
+    path_lines = []
+    for idx, path in enumerate(all_paths, 1):
+        entry_func = path[0]
+        sig = ''
+        params = public_signatures.get(entry_func, [])
+        if params:
+            sig = ', '.join(
+                '{} {}'.format(t, n) if n else t
+                for t, n in params
+            )
+        chain = ' -> '.join(path)
+        if len(path) == 1:
+            chain += '  (direct call - sink IS the public API)'
+        path_lines.append(
+            '  {idx}. {func}({sig})  :  {chain}'.format(
+                idx=idx, func=entry_func, sig=sig, chain=chain)
+        )
+
+    prompt = (
+        'You are a vulnerability researcher selecting the best public-API '
+        'entry point for a libFuzzer harness that must trigger a specific '
+        'vulnerability.\n\n'
+        'VULNERABILITY:\n'
+        '  CVE:              {cve}\n'
+        '  CWE:              {cwe}\n'
+        '  Affected function (sink): {sink}\n'
+        '  Description:      {desc}\n\n'
+        'CANDIDATE PATHS (entry_function(signature) : call chain):\n'
+        '{paths}\n\n'
+        'SELECTION CRITERIA (in priority order):\n'
+        '1. The entry point must give the harness DIRECT control over the '
+        'internal state that the vulnerability depends on.  Wrapper functions '
+        'that hide or pre-configure internal objects (e.g. allocating and '
+        'managing a stream struct internally) remove that control and are '
+        'WORSE even if they accept more pointer parameters.\n'
+        '2. Shorter paths are preferred - fewer hops means fewer chances for '
+        'the library to sanitise or discard fuzz input before it reaches the '
+        'sink.\n'
+        '3. If the sink function itself is a public API (direct / length-1 path), '
+        'strongly prefer it unless the vulnerability specifically requires '
+        'multi-step state setup that only a wrapper provides.\n\n'
+        'Return a JSON object:\n'
+        '{{\n'
+        '  "selected_path": <1-based index of the best path>,\n'
+        '  "reasoning": "<1-3 sentences explaining why this path is best>"\n'
+        '}}'
+    ).format(
+        cve=cve_id,
+        cwe=cwe_id or 'unknown',
+        sink=affected_func,
+        desc=description[:800] if description else 'No description available.',
+        paths='\n'.join(path_lines),
+    )
+
+    # ── Cache check ──
+    cache_file = None
+    if cache_dir:
+        cache_dir_p = Path(cache_dir)
+        path_key = '|'.join(
+            '->'.join(p) for p in sorted(all_paths, key=lambda x: '->'.join(x))
+        )
+        key = hashlib.sha256(
+            (sink_name + path_key + cve_id).encode()
+        ).hexdigest()[:16]
+        cache_file = cache_dir_p / 'llm_entry_path_{}.json'.format(key)
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding='utf-8'))
+                sel = cached.get('selected_path')
+                if isinstance(sel, int) and 1 <= sel <= len(all_paths):
+                    print('[llm_select_entry_path] Using cached selection: path {}'.format(sel))
+                    return all_paths[sel - 1]
+            except Exception:
+                pass
+
+    # ── LLM call ──
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix='rf_entry_path_'))
+        prompt_file = tmp_dir / 'prompt_entry_path.md'
+        out_file = tmp_dir / 'response.json'
+        prompt_file.write_text(prompt, encoding='utf-8')
+
+        ok, msg = run_openai_json(
+            prompt_path=prompt_file,
+            out_path=out_file,
+            model=model,
+            api_base=api_base,
+            max_retries=2,
+        )
+        if not ok:
+            print('[llm_select_entry_path] LLM call failed: {}'.format(msg),
+                  file=sys.stderr)
+            return None
+
+        result = json.loads(out_file.read_text(encoding='utf-8'))
+    except Exception as exc:
+        print('[llm_select_entry_path] Error: {}'.format(exc), file=sys.stderr)
+        return None
+
+    # ── Parse & validate ──
+    sel = result.get('selected_path')
+    reasoning = result.get('reasoning', '')
+    if not isinstance(sel, int) or sel < 1 or sel > len(all_paths):
+        print('[llm_select_entry_path] Invalid selection {} (need 1-{}), '
+              'falling back to heuristics'.format(sel, len(all_paths)),
+              file=sys.stderr)
+        return None
+
+    selected = all_paths[sel - 1]
+    # Sanitize reasoning to ASCII for Python 3.5 Docker containers
+    safe_reasoning = reasoning.encode('ascii', 'replace').decode('ascii') if reasoning else ''
+    print('[llm_select_entry_path] LLM selected path {}: {} - {}'.format(
+        sel, ' -> '.join(selected), safe_reasoning))
+
+    # ── Cache result ──
+    if cache_file:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(
+                {'selected_path': sel, 'reasoning': reasoning}, indent=2
+            ), encoding='utf-8')
+        except Exception:
+            pass
+
+    return selected
+
+
+def llm_plan_harness_strategy(entry_function, entry_signature_params, sink_function,
+                               call_path_names, setup_apis, update_apis, cleanup_apis,
+                               sink_source_snippet, cache_dir=None):
+    """Use the LLM to plan the harness execution strategy.
+
+    Replaces the heuristic planning chain (infer_path_semantic_traits,
+    _select_direct_stages, build_milestone_plan, refine_active_data_plan_from_path)
+    with a single LLM call that reads the full context and produces a clean plan.
+
+    Returns a dict with any subset of:
+      - input_model       (overrides heuristic + path-refined input_model)
+      - parameter_roles   (entry-function-level parameter strategies)
+      - call_sequence     (ordered API call plan)
+      - milestone_plan    (required state milestones)
+      - support_objects   (objects to construct)
+      - constraints       (specific constraints)
+    Returns {} on failure.
+    """
+    import hashlib
+    import tempfile
+
+    try:
+        from llm_adapters.openai import run_openai_json
+    except ImportError:
+        return {}
+
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_TOKEN")):
+        return {}
+
+    model, api_base = _load_llm_config()
+
+    def _fmt_param(p):
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            return '{} {}'.format(p[0], p[1])
+        if isinstance(p, dict):
+            return '{} {}'.format(p.get('type', '?'), p.get('name', '?'))
+        return str(p)
+
+    sig = ', '.join(_fmt_param(p) for p in (entry_signature_params or [])[:10])
+    path = ' -> '.join(call_path_names) if call_path_names else 'direct'
+    setup = ', '.join(setup_apis[:10]) if setup_apis else 'none found'
+    update = ', '.join(update_apis[:10]) if update_apis else 'none found'
+    cleanup = ', '.join(cleanup_apis[:10]) if cleanup_apis else 'none found'
+
+    prompt = """You are a vulnerability researcher designing a libFuzzer harness to trigger a specific vulnerability.
+
+ENTRY FUNCTION (public API the harness calls):
+  {entry}({sig})
+
+VULNERABLE FUNCTION (internal sink we need to reach):
+  {sink}
+
+CALL PATH from entry to sink:
+  {path}
+
+AVAILABLE PUBLIC APIs discovered in the library:
+- Setup/init: {setup}
+- Update/feed: {update}
+- Cleanup/free: {cleanup}
+
+SINK FUNCTION SOURCE (excerpt):
+```c
+{source}
+```
+
+Design an execution plan for a libFuzzer harness that calls the entry function to reach the sink.
+
+Return a JSON object:
+{{
+  "input_model": {{
+    "primary": "structured-format" or "raw-buffer" or "semantic-arguments",
+    "format_type": "XML" or "JSON" or "PNG" or "TIFF" or "ZIP" or "gzip" or "unknown",
+    "secondary": ["from: magic-or-container-header, mode-selection, stateful-object, streaming-or-incremental, numeric-controls, parser-lifecycle, post-parse-work-units"],
+    "evidence": ["clear reasons for classification"]
+  }},
+  "parameter_roles": [
+    {{"name": "param_name", "type": "param_type", "role": "input-buffer or output-buffer or size or control or state or support-buffer or numeric or value", "strategy": "specific strategy for this parameter"}}
+  ],
+  "call_sequence": [
+    {{"phase": "setup", "function": "actual_function_name", "reason": "why"}},
+    {{"phase": "invoke", "function": "entry_function_name", "reason": "main call"}},
+    {{"phase": "cleanup", "function": "cleanup_function_name", "reason": "why"}}
+  ],
+  "milestone_plan": [
+    {{"name": "milestone", "kind": "category", "goal": "what to achieve", "harness_expectation": "what the harness does"}}
+  ],
+  "support_objects": [
+    {{"name": "object_name", "kind": "type", "reason": "why the harness must create this"}}
+  ],
+  "constraints": ["specific constraints - not generic boilerplate"]
+}}
+
+RULES:
+- call_sequence MUST use real function names from the available APIs above. Do NOT invent function names.
+- parameter_roles should describe the ENTRY function's parameters, not the sink's internal parameters.
+- milestone_plan should only include milestones specific to THIS vulnerability path. Skip generic lifecycle milestones if they don't matter.
+- constraints should be specific and actionable. Skip "do not pass null" type generic advice.
+- If the entry function is a parser (XML, JSON, image decoder), input_model.primary should be "structured-format" with the correct format_type.""".format(
+        entry=entry_function or '?',
+        sig=sig,
+        sink=sink_function or '?',
+        path=path,
+        setup=setup,
+        update=update,
+        cleanup=cleanup,
+        source=(sink_source_snippet or '')[:3000],
+    )
+
+    # Cache check
+    cache_file = None
+    if cache_dir:
+        cache_dir = Path(cache_dir)
+        key = hashlib.sha256(
+            ((entry_function or '') + (sink_function or '') + path).encode()
+        ).hexdigest()[:16]
+        cache_file = cache_dir / 'llm_harness_strategy_{}.json'.format(key)
+        if cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                if cached.get('input_model') or cached.get('call_sequence'):
+                    print("[llm_harness_strategy] Using cached strategy for {} -> {}".format(
+                        entry_function, sink_function))
+                    return cached
+            except Exception:
+                pass
+
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="rf_harness_strategy_"))
+        prompt_file = tmp_dir / "prompt_harness_strategy.md"
+        out_file = tmp_dir / "response.json"
+        prompt_file.write_text(prompt, encoding="utf-8")
+
+        ok, msg = run_openai_json(
+            prompt_path=prompt_file,
+            out_path=out_file,
+            model=model,
+            api_base=api_base,
+            max_retries=2,
+        )
+        if not ok:
+            print("[llm_harness_strategy] LLM call failed: {}".format(msg),
+                  file=sys.stderr)
+            return {}
+
+        result = json.loads(out_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print("[llm_harness_strategy] Error: {}".format(exc), file=sys.stderr)
+        return {}
+
+    # Validate and extract
+    strategy = {}
+    if 'input_model' in result and isinstance(result['input_model'], dict):
+        im = result['input_model']
+        if im.get('primary') in ('structured-format', 'raw-buffer', 'semantic-arguments'):
+            strategy['input_model'] = im
+    if 'parameter_roles' in result and isinstance(result['parameter_roles'], list):
+        strategy['parameter_roles'] = result['parameter_roles'][:15]
+    if 'call_sequence' in result and isinstance(result['call_sequence'], list):
+        strategy['call_sequence'] = result['call_sequence'][:12]
+    if 'milestone_plan' in result and isinstance(result['milestone_plan'], list):
+        strategy['milestone_plan'] = result['milestone_plan'][:8]
+    if 'support_objects' in result and isinstance(result['support_objects'], list):
+        strategy['support_objects'] = result['support_objects'][:6]
+    if 'constraints' in result and isinstance(result['constraints'], list):
+        strategy['constraints'] = result['constraints'][:8]
+
+    # Cache
+    if cache_file and strategy:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(strategy, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    print("[llm_harness_strategy] LLM planned {} -> {} - input: {}, {} steps".format(
+        entry_function, sink_function,
+        strategy.get('input_model', {}).get('primary', '?'),
+        len(strategy.get('call_sequence', []))))
+    return strategy
+
+
 def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln_context, public_signatures, public_api_names):
     """Build a generic, machine-readable harness construction plan."""
     path_names = [usr_to_name.get(item, item) for item in wrapper_path]
+
+    # Trace which entry parameters flow through the call path to the sink.
+    param_flow = trace_parameter_flow(path_names)
+
     signature_params = public_signatures.get(public_api_name, []) if public_signatures else []
     signature_roles = build_parameter_roles_from_signature(signature_params)
     sink_function = vuln_context.get('function_name') or ''
@@ -1665,6 +2026,16 @@ def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln
     vuln_context = _sanitize_parameter_role_context(vuln_context, original_context.get('parameter_roles', []), parameter_roles)
     input_model = vuln_context.get('input_model', {})
     vuln_context = _sanitize_support_object_context(vuln_context, parameter_roles, input_model)
+
+    # For parser/decoder entry functions that accept data+size, simplify the
+    # input-buffer strategy — the LLM should pass raw fuzz data directly
+    # instead of malloc+copy+null-terminate which can mask OOB reads.
+    if public_api_name and _PARSER_ENTRY_RE.search(public_api_name):
+        has_size = any(r.get('role') == 'size' for r in parameter_roles)
+        if has_size:
+            for role in parameter_roles:
+                if role.get('role') == 'input-buffer':
+                    role['strategy'] = 'pass raw fuzz data directly - the function accepts an explicit length parameter'
     setup_candidates = collect_phase_candidates(vuln_context, 'setup', public_api_name, public_api_names)
     update_candidates = collect_phase_candidates(vuln_context, 'update', public_api_name, public_api_names)
     cleanup_candidates = collect_phase_candidates(vuln_context, 'cleanup', public_api_name, public_api_names)
@@ -1723,15 +2094,6 @@ def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln
         'Keep buffer sizes and length fields internally consistent.',
         'Cleanup in normal API order and avoid double-finalization in the harness.'
     ]
-    cwe_id = (entry.get('cwe-id') or '').upper().replace('CWE-', '')
-    if cwe_id in ('125', '126'):
-        # OOB-read: over-allocation or null-termination past the declared
-        # length hides the overread from sanitizers.
-        constraints.append(
-            'For this OOB-read vulnerability, allocate input buffers with EXACTLY the '
-            'declared length. Do NOT add a null terminator or pad byte beyond that '
-            'length; any overread by the library must land in unallocated memory so '
-            'AddressSanitizer can detect it.')
     if input_model.get('primary') == 'structured-format':
         constraints.append('Do not feed arbitrary raw bytes directly if the target path expects a minimally valid container or header.')
     if update_candidates:
@@ -1804,17 +2166,122 @@ def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln
         'candidates': cleanup_candidates,
     })
 
-    coverage_goals = list(direct_context.get('execution_hints', []))
-    for insight in direct_context.get('insights', []):
-        if len(coverage_goals) >= 8:
-            break
-        coverage_goals.append(insight)
-    coverage_goals = _dedupe_text_items(coverage_goals)
+    # NOTE: coverage_goals are intentionally NOT built from
+    # direct_context['execution_hints'] or direct_context['insights'] —
+    # those are sink-centric analysis.  Only non-sink sources (e.g.
+    # retrieved stage evidence placement hints) contribute.
+    coverage_goals = []
     if deferred_stages:
         for item in retrieved_stage_evidence.get('placement_hints', [])[:2]:
             if item not in coverage_goals:
                 coverage_goals.append(item)
     coverage_goals = _dedupe_text_items(coverage_goals)
+
+    # ── LLM-based execution strategy override ──
+    # The heuristic pipeline above uses keyword-matching (path trait tokens,
+    # parameter name substrings) that produces frequent misclassifications.
+    # Ask the LLM to plan the strategy with full context and override.
+    llm_strategy = llm_plan_harness_strategy(
+        entry_function=public_api_name,
+        entry_signature_params=signature_params,
+        sink_function=entry.get('affected-function'),
+        call_path_names=path_names,
+        setup_apis=setup_candidates,
+        update_apis=update_candidates,
+        cleanup_apis=cleanup_candidates,
+        sink_source_snippet=vuln_context.get('source_snippet', ''),
+        cache_dir=vuln_context.get('project_root'),
+    )
+
+    if llm_strategy:
+        # Override input_model — this is the #1 misclassification issue
+        if 'input_model' in llm_strategy:
+            input_model = llm_strategy['input_model']
+
+        # Override parameter_roles with LLM-classified entry-level roles
+        if 'parameter_roles' in llm_strategy:
+            llm_roles = llm_strategy['parameter_roles']
+            # Merge: LLM roles take precedence, keep heuristic roles for
+            # parameters the LLM didn't mention
+            llm_role_map = {}
+            for r in llm_roles:
+                name = r.get('name')
+                if name:
+                    llm_role_map[name] = r
+            merged_roles = []
+            for existing in parameter_roles:
+                name = existing.get('name')
+                if name and name in llm_role_map:
+                    llm_r = llm_role_map.pop(name)
+                    merged_roles.append({
+                        'name': name,
+                        'type': existing.get('type', llm_r.get('type', '')),
+                        'role': llm_r.get('role', existing.get('role', 'value')),
+                        'strategy': llm_r.get('strategy', existing.get('strategy', '')),
+                    })
+                else:
+                    merged_roles.append(existing)
+            # Add any LLM-only params not in existing roles
+            for name, llm_r in llm_role_map.items():
+                merged_roles.append({
+                    'name': name,
+                    'type': llm_r.get('type', ''),
+                    'role': llm_r.get('role', 'value'),
+                    'strategy': llm_r.get('strategy', ''),
+                })
+            parameter_roles = merged_roles
+
+        # Override call_sequence with LLM-planned sequence
+        if 'call_sequence' in llm_strategy:
+            llm_seq = llm_strategy['call_sequence']
+            # Convert LLM format to internal format
+            new_call_sequence = []
+            for step in llm_seq:
+                phase = step.get('phase', 'invoke')
+                func = step.get('function', '')
+                reason = step.get('reason', '')
+                new_call_sequence.append({
+                    'phase': phase,
+                    'goal': reason,
+                    'candidates': [func] if func else [],
+                })
+            if new_call_sequence:
+                call_sequence = new_call_sequence
+
+        # Override milestone_plan
+        if 'milestone_plan' in llm_strategy:
+            llm_milestones = llm_strategy['milestone_plan']
+            new_milestones = []
+            for m in llm_milestones:
+                new_milestones.append({
+                    'name': m.get('name', 'milestone'),
+                    'kind': m.get('kind', 'lifecycle'),
+                    'required': True,
+                    'goal': m.get('goal', ''),
+                    'evidence': [],
+                    'harness_expectation': m.get('harness_expectation', ''),
+                })
+            if new_milestones:
+                milestone_plan = new_milestones
+
+        # Override support object construction
+        if 'support_objects' in llm_strategy:
+            llm_support = llm_strategy['support_objects']
+            if llm_support:
+                support_object_construction = [
+                    {
+                        'name': s.get('name', ''),
+                        'kind': s.get('kind', 'object'),
+                        'reason': s.get('reason', ''),
+                    }
+                    for s in llm_support
+                ]
+
+        # Override constraints
+        if 'constraints' in llm_strategy:
+            llm_constraints = llm_strategy['constraints']
+            if llm_constraints:
+                constraints = llm_constraints
 
     return {
         'entry_function': public_api_name,
@@ -1835,7 +2302,6 @@ def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln
         'sink_activation_conditions': sink_activation_conditions,
         'invariant_requirements': invariant_requirements,
         'exploration_policy': exploration_policy,
-        'state_fields': state_fields[:8],
         'setup_candidates': setup_candidates,
         'update_candidates': update_candidates,
         'cleanup_candidates': cleanup_candidates,
@@ -1850,6 +2316,8 @@ def build_execution_plan(entry, public_api_name, wrapper_path, usr_to_name, vuln
         'direct_stages': direct_stages,
         'deferred_stages': deferred_stages,
         'retrieved_stage_evidence': retrieved_stage_evidence,
+        'parameter_flow': param_flow,
+        'sink_internal_params': param_flow.get('sink_internal_params', []),
     }
 
 
@@ -1867,8 +2335,27 @@ def build_vulnerability_context(root, entry):
 
     analysis = analyze_vulnerable_function(source_path, affected_function, debug=False)
     if analysis.get('error'):
-        print('DEBUG: vuln_analyzer failed: ' + str(analysis.get('error')))
-        return {}
+        # The patch may touch a different file than the one containing the
+        # function definition (e.g. png.c patch, but function in pngread.c).
+        # Search other project source files for the function definition.
+        print('DEBUG: vuln_analyzer failed on {}, searching other source files...'.format(affected_file))
+        root_path = Path(root)
+        found = False
+        for pattern in ['**/*.c', '**/*.cc', '**/*.cpp', '**/*.cxx']:
+            for candidate in root_path.glob(pattern):
+                if candidate == source_path:
+                    continue
+                alt_analysis = analyze_vulnerable_function(candidate, affected_function, debug=False)
+                if not alt_analysis.get('error'):
+                    print('DEBUG: Found {} in {}'.format(affected_function, candidate))
+                    analysis = alt_analysis
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            print('DEBUG: vuln_analyzer failed: ' + str(analysis.get('error')))
+            return {}
 
     return {
         'project_root': root,
@@ -1961,6 +2448,55 @@ def find_public_api_by_name(log_path, sink_func, sink_file):
     
     return public_apis
 
+
+def _extract_path_source_excerpts(root, wrapper_path, usr_to_name, usr_to_file, entry):
+    """Extract smart source excerpts for functions on the best call path + trigger function.
+
+    Returns a dict mapping function_name → excerpt string.
+    """
+    from llvm_callgraph import _resolve_ll_to_source_path
+    try:
+        from vuln_analyzer import extract_smart_excerpt
+    except ImportError:
+        return {}
+
+    excerpts = {}
+    # Collect function names to extract
+    path_names = [usr_to_name.get(u, u) for u in wrapper_path]
+    trigger_funcs = entry.get('trigger_condition', {}).get('affected_functions', [])
+    func_names = list(path_names) + [tf for tf in trigger_funcs if tf not in path_names]
+
+    for func_name in func_names:
+        if func_name in excerpts:
+            continue
+        # Find source file location
+        loc = usr_to_file.get(func_name, '')
+        if not loc:
+            # Try the USR form
+            for usr, name in usr_to_name.items():
+                if name == func_name:
+                    loc = usr_to_file.get(usr, '')
+                    if loc:
+                        break
+        if not loc:
+            continue
+
+        src_path = _resolve_ll_to_source_path(loc, root)
+        if not src_path or not os.path.exists(src_path):
+            continue
+
+        # Use compact excerpt for intermediate functions (2000 chars),
+        # larger for entry/sink (3000 chars)
+        is_endpoint = (func_name == path_names[0] or func_name == path_names[-1])
+        max_chars = 3000 if is_endpoint else 2000
+        excerpt = extract_smart_excerpt(src_path, func_name, max_chars=max_chars)
+        if excerpt:
+            excerpts[func_name] = excerpt
+            print("DEBUG: Extracted source excerpt for {} ({} chars)".format(func_name, len(excerpt)))
+
+    return excerpts
+
+
 def main():
     p = argparse.ArgumentParser(description="Generate harness plan from vuln and build log")
     p.add_argument("--root", required=True, help="Project root directory")
@@ -1979,8 +2515,15 @@ def main():
 
     sink_file = entry.get("affected-file")
     sink_func = entry.get("affected-function")
-    if not sink_file or not sink_func:
-        sys.exit("Vulnerability entry must include affected-file and affected-function")
+    if not sink_func:
+        print("WARNING: affected-function not found for {}. "
+              "Enrichment could not auto-derive it from description, patches, "
+              "references, or LLM. Skipping this vulnerability.".format(
+                  entry.get('cve-id', '?')), file=sys.stderr)
+        sys.exit(1)
+    # affected-file is optional — if missing, search the callgraph and source tree
+    if not sink_file:
+        print("DEBUG: affected-file not provided, will locate via callgraph or source tree")
 
     # Load compile commands for public API discovery
     pub_cmds = load_pubcmds(args.log)
@@ -1991,6 +2534,67 @@ def main():
     
     # For sink USR, use function name directly (LLVM IR uses function names, not USRs)
     sink_usr = sink_func  # In LLVM IR, we use function names as identifiers
+
+    # Auto-locate affected-file from callgraph if not provided
+    if not sink_file:
+        # Try usr_to_file first (sink_func is the "USR" in LLVM IR mode)
+        loc = usr_to_file.get(sink_func, "")
+        if loc:
+            sink_file = loc.split(":")[0] if ":" in loc else loc
+            # LLVM IR paths (.ll) need resolution to their .c/.cpp source
+            if sink_file.endswith('.ll'):
+                # e.g. /src/expat/expat/lib/.libs/xmlparse.ll → xmlparse.c
+                # LLVM IR filenames may embed the original source extension:
+                #   cjson_add.c.ll → ll_base = 'cjson_add.c'
+                # Strip both the .ll and any embedded source extension to
+                # get the true stem for matching.
+                ll_base = os.path.splitext(os.path.basename(sink_file))[0]
+                _src_exts = ('.c', '.cc', '.cpp', '.cxx')
+                stem = ll_base
+                # Strip libtool prefix: libfoo_la-bar → bar
+                stem = re.sub(r'^lib\w+_la-', '', stem)
+                for _ext in _src_exts:
+                    if ll_base.endswith(_ext):
+                        stem = ll_base[:-len(_ext)]
+                        break
+                import glob
+                for ext in ('*.c', '*.cc', '*.cpp', '*.cxx'):
+                    for src in glob.glob(os.path.join(args.root, '**', ext), recursive=True):
+                        if os.path.splitext(os.path.basename(src))[0] == stem:
+                            sink_file = os.path.relpath(src, args.root)
+                            break
+                    if not sink_file.endswith('.ll'):
+                        break
+                else:
+                    # Could not resolve .ll to source — use ll_base if it
+                    # already has a source extension, otherwise append .c
+                    if any(ll_base.endswith(e) for e in _src_exts):
+                        sink_file = ll_base
+                    else:
+                        sink_file = ll_base + '.c'
+            # Make relative to root
+            if os.path.isabs(sink_file) and sink_file.startswith(args.root):
+                sink_file = os.path.relpath(sink_file, args.root)
+            entry["affected-file"] = sink_file
+            print("DEBUG: Auto-located affected-file from callgraph: {}".format(sink_file))
+        else:
+            # Fallback: grep for function definition in source files
+            import glob
+            for src in glob.glob(os.path.join(args.root, '**', '*.c'), recursive=True):
+                try:
+                    with open(src, 'r', errors='ignore') as f:
+                        for line in f:
+                            if re.search(r'\b' + re.escape(sink_func) + r'\s*\(', line):
+                                sink_file = os.path.relpath(src, args.root)
+                                entry["affected-file"] = sink_file
+                                print("DEBUG: Auto-located affected-file from source grep: {}".format(sink_file))
+                                break
+                    if sink_file:
+                        break
+                except Exception:
+                    continue
+        if not sink_file:
+            sys.exit("Could not locate source file for function '{}'. Provide affected-file manually.".format(sink_func))
 
     # Discover public APIs from header files (GENERIC - no hardcoded prefixes)
     public_dirs = find_public_include_dirs(pub_cmds, args.root)
@@ -2152,6 +2756,7 @@ def main():
     # Find wrapper path using USRs
     wrapper_path = find_public_wrapper(adj, usr_to_file, sink_usr, list(public_usrs))
     public_api_name = None  # Initialize
+    all_scored_paths = []  # All candidate paths with scores (for prompt)
     
     # If not found by USR, try name-based matching
     if not wrapper_path:
@@ -2208,7 +2813,6 @@ def main():
             visited = set([sink_name])
             found_path = None
             all_paths = []  # Collect all paths to public APIs
-            sink_self_path = None  # Deferred: sink-as-its-own-entry (fallback only)
             
             # DEBUG: Check if sink is in public_api_names right before BFS
             print("DEBUG: Right before BFS - Is sink '" + str(sink_name) + "' in public_api_names? " + str(sink_name in public_api_names))
@@ -2219,15 +2823,14 @@ def main():
                 
                 # Check if this is a public API (by name)
                 if cur in public_api_names:
-                    # If this is the sink itself (path length 1), defer it as a
-                    # fallback.  Prefer callers that provide a richer calling
-                    # context over having the sink call itself directly.
-                    if len(path) == 1 and cur == sink_name:
-                        sink_self_path = path
-                        # IMPORTANT: Do NOT continue — still explore callers of
-                        # the sink so that caller paths can be discovered.
-                    else:
-                        all_paths.append(path)
+                    # Always include the path — even when the sink itself
+                    # is a public API (length-1 self-path).  The taint
+                    # scorer will rank it against wrapper paths on merit
+                    # (direct data control, no hop penalty, etc.).
+                    all_paths.append(path)
+                    # For the self-path keep exploring callers so wrapper
+                    # paths are still discovered; for wrapper paths stop.
+                    if not (len(path) == 1 and cur == sink_name):
                         continue
                 
                 # Find callers of current function - SORT for determinism
@@ -2238,22 +2841,44 @@ def main():
                         new_path = [caller] + path
                         queue.append(new_path)
             
-            # Use the deferred self-path only when no caller path was found.
-            if not all_paths and sink_self_path:
-                all_paths.append(sink_self_path)
-            
             # Prefer entry-point candidates, but still score them instead of taking the first BFS hit.
             if all_paths:
                 candidate_paths = [path for path in all_paths if path[0] in entry_point_candidates]
                 if candidate_paths:
                     all_paths = candidate_paths
 
+            # ── LLM-based path selection (before heuristic scoring) ──
+            # When multiple candidate paths exist, ask the LLM to pick the
+            # best entry point using vulnerability context that heuristics lack.
+            llm_selected = False
+            if all_paths and len(all_paths) > 1:
+                llm_path = llm_select_entry_path(
+                    all_paths, sink_name, entry, public_signatures,
+                    cache_dir=args.root,
+                )
+                if llm_path is not None:
+                    found_path = llm_path
+                    llm_selected = True
+                else:
+                    print("WARNING: LLM entry-path selection unavailable or "
+                          "failed, falling back to heuristic scoring",
+                          file=sys.stderr)
+
             # Score candidate paths using path-flow and taint heuristics.
+            # Also boost paths that go through trigger-relevant (patch-affected) functions.
+            trigger_funcs = set(
+                entry.get('trigger_condition', {}).get('affected_functions', [])
+            )
             if all_paths:
                 # Score each path using taint analysis
                 scored_paths = []
                 for p in all_paths:
                     score = score_path_taint(p)
+                    # Bonus for paths passing through patch-affected functions
+                    if trigger_funcs:
+                        overlap = trigger_funcs.intersection(p)
+                        if overlap:
+                            score += 30 * len(overlap)
                     scored_paths.append((score, p))
                 
                 # Sort by score (highest first)
@@ -2262,11 +2887,27 @@ def main():
                 # Print all paths with scores
                 print("DEBUG: Found " + str(len(all_paths)) + " paths to public APIs (sorted by taint score):")
                 for i, (score, p) in enumerate(scored_paths[:20]):  # Show top 20
-                    print("  Path " + str(i+1) + " (score=" + str(score) + "): " + " -> ".join(p))
+                    flag = ""
+                    if trigger_funcs and trigger_funcs.intersection(p):
+                        flag = " [* trigger]"
+                    sel_flag = " [<- LLM selected]" if llm_selected and p == found_path else ""
+                    print("  Path " + str(i+1) + " (score=" + str(score) + ")" + flag + sel_flag + ": " + " -> ".join(p))
                 
-                # Use the highest-scoring path
-                found_path = scored_paths[0][1]
-                print("DEBUG: Selected path with highest taint score: " + " -> ".join(found_path))
+                # Use LLM selection if available, otherwise highest-scoring path
+                if not llm_selected:
+                    found_path = scored_paths[0][1]
+                # Store all scored paths for prompt (limit to top 10)
+                for score, p in scored_paths[:10]:
+                    has_trigger = bool(trigger_funcs and trigger_funcs.intersection(p))
+                    all_scored_paths.append({
+                        'path': p,
+                        'score': score,
+                        'has_trigger': has_trigger,
+                    })
+                if llm_selected:
+                    print("DEBUG: Selected path via LLM: " + " -> ".join(found_path))
+                else:
+                    print("DEBUG: Selected path with highest taint score: " + " -> ".join(found_path))
             
             if found_path:
                 # Convert names back to USRs
@@ -2365,6 +3006,20 @@ def main():
         wrapper_path,
     )
 
+    # ── Extract source excerpts for call-path + trigger functions ──
+    path_source_excerpts = _extract_path_source_excerpts(
+        args.root, wrapper_path, usr_to_name, usr_to_file, entry
+    )
+
+    # Identify trigger function (patch-affected function NOT on best path)
+    trigger_funcs = set(entry.get('trigger_condition', {}).get('affected_functions', []))
+    best_path_names = [usr_to_name.get(u, u) for u in wrapper_path]
+    trigger_function = ''
+    for tf in trigger_funcs:
+        if tf not in best_path_names and tf != sink_func:
+            trigger_function = tf
+            break
+
     # Emit harness plan
     plan = {
         "vuln_entry": entry,
@@ -2373,10 +3028,14 @@ def main():
         "usr_to_file": plan_usr_to_file,
         "usr_to_name": plan_usr_to_name,
         "public_api_name": public_api_name,
+        "public_api_names": sorted(public_api_names),
         "vuln_context": vuln_context,
         "execution_plan": execution_plan,
         "trigger_plan": trigger_plan,
         "construction_plan": construction_plan,
+        "all_call_paths": all_scored_paths,
+        "trigger_function": trigger_function,
+        "path_source_excerpts": path_source_excerpts,
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(plan, f, indent=2)

@@ -21,6 +21,20 @@ def _read_text(path):
         return ""
 
 
+# Regex matching common one-shot parser/reader/decoder function name patterns.
+# When the entry function matches, raw data+size is the *expected* calling
+# convention, so _direct_raw_buffer_call violations should be suppressed.
+_PARSER_ENTRY_RE = re.compile(
+    r'(?:parse|read|decode|load|deserialize|from_?(?:string|buffer|data|bytes|json|xml|yaml|cbor|msgpack))',
+    re.IGNORECASE,
+)
+
+
+def _is_parser_entry(func_name):
+    """Return True if func_name looks like a one-shot parser/reader/decoder."""
+    return bool(func_name and _PARSER_ENTRY_RE.search(func_name))
+
+
 def _count_calls(code, func_name):
     if not code or not func_name:
         return 0
@@ -47,13 +61,15 @@ def _has_generic_state_setup(code):
     return bool(pattern.search(code or ''))
 
 
-def _has_transform_configuration(code):
+def _has_transform_configuration(code, plan_keywords=None):
+    generic_tokens = ['transform', 'option', 'config', 'convert', 'scale']
+    tokens = list(plan_keywords or []) + generic_tokens
     pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(', re.IGNORECASE)
     for match in pattern.finditer(code or ''):
         name = match.group(1).lower()
-        if name in ['setjmp', 'memset', 'memcpy']:
+        if name in ['setjmp', 'memset', 'memcpy', 'if', 'for', 'while', 'return', 'sizeof']:
             continue
-        if any(token in name for token in ['quant', 'transform', 'palette', 'gamma', 'background', 'color', 'option', 'config', 'expand', 'convert', 'scale']):
+        if any(token in name for token in tokens):
             return True
     return False
 
@@ -132,21 +148,42 @@ def _counts_data_usages(code):
     return len(re.findall(r'\bdata\s*(?:\[|\+|,|\))', code or ''))
 
 
-def _has_data_driven_support_object(code):
-    patterns = [
-        r'palette\s*\[[^\]]+\][^;\n]*=\s*.*data',
-        r'histogram\s*\[[^\]]+\][^;\n]*=\s*.*data',
-        r'background\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*.*data',
-        r'row[^\n;=]*=\s*.*data',
-        r'scanline[^\n;=]*=\s*.*data',
-    ]
-    return any(re.search(pattern, code or '', re.IGNORECASE) for pattern in patterns)
+def _has_data_driven_support_object(code, support_keywords=None):
+    keywords = list(support_keywords or [])
+    if not keywords:
+        return False
+    for kw in keywords:
+        pattern = re.compile(r'\b' + re.escape(kw) + r'\s*\[[^\]]+\][^;\n]*=\s*.*data', re.IGNORECASE)
+        if pattern.search(code or ''):
+            return True
+        pattern2 = re.compile(r'\b' + re.escape(kw) + r'[^\n;=]*=\s*.*data', re.IGNORECASE)
+        if pattern2.search(code or ''):
+            return True
+    return False
 
 
 def _extract_stack_symbols(output):
+    """Extract function names from the primary ASAN crash stack only.
+
+    ASAN output contains multiple sections: the crash stack, then metadata
+    sections like "allocated by:", "freed by:", "previously allocated by:",
+    and "Thread T" blocks.  We must only parse the *first* crash stack to
+    avoid false sink-hit classification when the sink appears only in
+    allocation metadata.
+    """
     symbols = []
-    pattern = re.compile(r'#\d+\s+[^\n]*?in\s+([A-Za-z_][A-Za-z0-9_:]*)')
-    for match in pattern.finditer(output or ''):
+    frame_re = re.compile(r'#\d+\s+[^\n]*?in\s+([A-Za-z_][A-Za-z0-9_:]*)')
+    # Stop markers: ASAN metadata sections that follow the primary crash stack.
+    stop_re = re.compile(
+        r'^\s*(?:allocated by|freed by|previously allocated by|'
+        r'Thread T\d|SUMMARY:|==\d+==ABORTING)',
+        re.MULTILINE,
+    )
+    text = output or ''
+    # Find where the metadata begins and only parse up to that point.
+    stop_match = stop_re.search(text)
+    crash_section = text[:stop_match.start()] if stop_match else text
+    for match in frame_re.finditer(crash_section):
         symbols.append(match.group(1))
     return symbols
 
@@ -167,11 +204,16 @@ def classify_runtime_evidence(plan_path, output, returncode):
         score = 5
         rationale.append('the runtime probe crashed')
 
-    if sink_function and sink_function in stack_symbols:
+    # Check for harness-only crashes FIRST — if the crash stack points
+    # exclusively into generated harness code, don't let downstream
+    # sink-hit / sink-adjacent classification override that signal.
+    harness_fault = '/fuzzer.cc:' in (output or '') and not stack_symbols
+
+    if not harness_fault and sink_function and sink_function in stack_symbols:
         classification = 'sink-hit'
         score = 100
         rationale.append('the crash stack reached the selected sink function {}'.format(sink_function))
-    else:
+    elif not harness_fault:
         sink_adjacent = [name for name in call_path[-3:] if name in stack_symbols]
         path_hit = [name for name in call_path if name in stack_symbols]
         if sink_adjacent:
@@ -250,9 +292,16 @@ def _has_support_object_construction_evidence(code, construction_items):
     return True
 
 
-def _extract_support_keywords(construction_plan):
+def _extract_support_keywords(construction_plan, stage_contracts=None):
     keywords = set()
-    for item in construction_plan.get('support_objects', []):
+    items = list(construction_plan.get('support_objects', []))
+    items += list(construction_plan.get('support_object_construction', []))
+    for stage in (stage_contracts or {}).values():
+        if isinstance(stage, dict):
+            items += list(stage.get('support_object_construction', []))
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         for value in [item.get('name', ''), item.get('kind', ''), item.get('reason', '')]:
             for token in re.split(r'[^a-z0-9]+', value.lower()):
                 if len(token) >= 4:
@@ -273,7 +322,7 @@ def _has_variable_setup_argument(args, state_targets):
         return True
 
     ignored = set([
-        'const', 'false', 'nullptr', 'null', 'png', 'ptr', 'size', 'static', 'true', 'z_null'
+        'const', 'false', 'nullptr', 'null', 'ptr', 'size', 'static', 'true',
     ])
     for target in state_targets or []:
         ignored.update(re.split(r'[^a-z0-9_]+', (target or '').lower()))
@@ -326,7 +375,7 @@ def _extract_setup_bound_identifiers(code, entry_function, dependent):
     bound_lines = []
     assignments = {}
 
-    assign_pattern = re.compile(r'\b(?:int|unsigned|long|short|size_t|png_[A-Za-z0-9_]+)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+);')
+    assign_pattern = re.compile(r'\b(?:int|unsigned|long|short|size_t|[A-Za-z_][A-Za-z0-9_]*_t)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;]+);')
     for match in assign_pattern.finditer(pre_sink_code):
         lhs = match.group(1)
         rhs = match.group(2)
@@ -507,7 +556,7 @@ def _find_suspicious_null_helper_calls(code, construction_plan):
         args = match.group(2)
         lowered_func = func_name.lower()
         lowered_args = args.lower()
-        if 'nullptr' not in lowered_args and 'null' not in lowered_args and 'z_null' not in lowered_args:
+        if 'nullptr' not in lowered_args and 'null' not in lowered_args:
             continue
 
         # Count NULL vs total arguments — if only 1 out of many is null,
@@ -518,9 +567,16 @@ def _find_suspicious_null_helper_calls(code, construction_plan):
             continue
 
         helper_like = any(token in lowered_func for token in [
-            'set', 'init', 'create', 'config', 'quantize', 'palette', 'background',
+            'set', 'init', 'create', 'config',
             'transform', 'update', 'combine', 'progressive', 'record', 'header', 'frame'
         ])
+        # Cleanup/destructor functions are typically safe to call with NULL
+        # (e.g. cJSON_Delete(NULL), free(NULL), xmlFreeDoc(NULL)).
+        cleanup_like = any(token in lowered_func for token in [
+            'delete', 'free', 'destroy', 'close', 'release', 'cleanup', 'teardown', 'finalize'
+        ])
+        if cleanup_like:
+            continue
         support_related = any(token in lowered_func or token in lowered_args for token in keywords)
         has_positive_size = re.search(r'(^|[^A-Za-z_])(\d{1,6})([^A-Za-z_]|$)', args) is not None
 
@@ -696,11 +752,13 @@ def _find_early_transform_calls(code, entry_function, transform_api_names, callb
     return deduped[:4]
 
 
-def _find_dead_support_state_names(code):
+def _find_dead_support_state_names(code, support_keywords=None):
     if not code:
         return []
 
-    support_tokens = ['palette', 'lookup', 'table', 'hist', 'histogram', 'trans', 'gamma', 'background', 'row', 'scanline']
+    tokens = list(support_keywords or [])
+    if not tokens:
+        return []
     candidates = []
     patterns = [
         re.compile(r'([A-Za-z_][A-Za-z0-9_]*(?:->|\.)[A-Za-z_][A-Za-z0-9_]*)\s*\[[^\]]+\]\s*='),
@@ -710,7 +768,7 @@ def _find_dead_support_state_names(code):
         for match in pattern.finditer(code):
             name = match.group(1)
             lowered = name.lower()
-            if not any(token in lowered for token in support_tokens):
+            if not any(token in lowered for token in tokens):
                 continue
             candidates.append(name)
 
@@ -757,13 +815,31 @@ def validate_harness_source(plan_path, source_path):
     failure_path_indicators = vuln_context.get('failure_path_indicators', {})
     relation_diagnostics = []
 
+    # Derive support-object keywords from the plan so checks are generic.
+    support_keywords = _extract_support_keywords(construction_plan, stage_contracts)
+
     violations = []
     warnings = []
+    critical = False
     score = 100
+
+    # Parser/decoder entry functions (parse, read, decode, load, etc.) are
+    # designed to accept raw buffer + size -- don't penalise that pattern.
+    parser_entry = _is_parser_entry(entry_function)
+
+    # Resource-leak vulnerabilities (CWE-401, CWE-772, CWE-775) need simple
+    # harnesses that allocate without cleanup so ASan's leak detector fires.
+    # Complex support-object / trigger-relation infrastructure is counter-
+    # productive -- soften those checks like we do for parser entries.
+    vuln_entry = plan.get('vuln_entry', {})
+    cwe_id = vuln_entry.get('cwe-id', '')
+    _LEAK_CWES = {'CWE-401', 'CWE-772', 'CWE-775'}
+    leak_vuln = cwe_id in _LEAK_CWES
 
     if entry_function and _count_calls(code, entry_function) == 0:
         violations.append('Harness never calls the selected public entry function {}.'.format(entry_function))
         score -= 40
+        critical = True
 
     needs_state_setup = bool(setup_candidates) and (
         any(role.get('role') == 'state' for role in parameter_roles) or bool(state_fields)
@@ -774,22 +850,27 @@ def validate_harness_source(plan_path, source_path):
 
     missing_setup_calls = [item.get('name') for item in required_setup_calls[:4] if item.get('name') and _count_calls(code, item.get('name')) == 0]
     if missing_setup_calls:
-        violations.append('Harness is missing required setup or registration calls inferred from sink-gating state: {}.'.format(', '.join(missing_setup_calls)))
-        score -= 20
+        if parser_entry or leak_vuln:
+            warnings.append('Harness may be missing setup or registration calls inferred from sink-gating state ({} - may not be needed): {}.'.format(
+                'leak vulnerability' if leak_vuln else 'parser entry', ', '.join(missing_setup_calls)))
+            score -= 8
+        else:
+            violations.append('Harness is missing required setup or registration calls inferred from sink-gating state: {}.'.format(', '.join(missing_setup_calls)))
+            score -= 20
 
-    if 'repeated-records' in workload_model.get('operators', []) and not _has_loop(code):
+    if 'repeated-records' in workload_model.get('operators', []) and not _has_loop(code) and not parser_entry:
         violations.append('Workload model expects repeated logical records, but the harness does not appear to build them in a loop.')
         score -= 20
 
-    if 'chunked-stream' in workload_model.get('operators', []) and not _has_loop(code):
+    if 'chunked-stream' in workload_model.get('operators', []) and not _has_loop(code) and not parser_entry:
         violations.append('Workload model expects incremental or chunked processing, but the harness does not implement a repeated update-style flow.')
         score -= 20
 
-    if input_model.get('primary') == 'structured-format' and entry_function and _direct_raw_buffer_call(code, entry_function):
+    if not parser_entry and input_model.get('primary') == 'structured-format' and entry_function and _direct_raw_buffer_call(code, entry_function):
         violations.append('Execution plan expects structured input shaping, but the harness appears to pass raw data/size directly into the target API.')
         score -= 20
 
-    if construction_plan.get('requires_container_synthesis') and _direct_raw_buffer_call(code, entry_function) and not _looks_like_synthesized_container(code, entry_function):
+    if not parser_entry and construction_plan.get('requires_container_synthesis') and _direct_raw_buffer_call(code, entry_function) and not _looks_like_synthesized_container(code, entry_function):
         violations.append('Construction plan requires synthesizing a minimally valid structured container, but the harness appears to forward raw input bytes after a control prefix instead of building a fresh container.')
         score -= 25
 
@@ -799,7 +880,7 @@ def validate_harness_source(plan_path, source_path):
         'incremental-feed' in set([item.get('kind') for item in milestone_plan if item.get('required')]) or
         'chunked-stream' in workload_model.get('operators', [])
     )
-    if path_requires_staged_input and _looks_like_direct_progressive_passthrough(code, entry_function) and not _has_structured_container_shaping(code, entry_function):
+    if not parser_entry and path_requires_staged_input and _looks_like_direct_progressive_passthrough(code, entry_function) and not _has_structured_container_shaping(code, entry_function):
         violations.append('The selected wrapper path is parser or progressive-read oriented, but the harness appears to feed raw fuzz bytes directly into the public API without constructing a minimally valid structured input first.')
         score -= 25
 
@@ -811,7 +892,7 @@ def validate_harness_source(plan_path, source_path):
         warnings.append('The harness may be spending entropy on too many direct byte-to-parameter mappings instead of stabilizing low-signal knobs.')
         score -= 5
 
-    if input_model.get('primary') == 'semantic-arguments' and _direct_raw_buffer_call(code, entry_function):
+    if not parser_entry and input_model.get('primary') == 'semantic-arguments' and _direct_raw_buffer_call(code, entry_function):
         violations.append('Execution plan models this sink as semantic arguments or support objects, but the harness still appears to forward raw fuzzer bytes directly into the target API.')
         score -= 20
 
@@ -836,7 +917,7 @@ def validate_harness_source(plan_path, source_path):
             )
             if relation_reason:
                 message += ' Diagnostic: {}.'.format(relation_reason)
-            if relation.get('priority') == 'high':
+            if relation.get('priority') == 'high' and not leak_vuln:
                 violations.append(message)
                 score -= 18
             else:
@@ -850,11 +931,12 @@ def validate_harness_source(plan_path, source_path):
     for requirement in setup_requirements[:3]:
         if not _has_setup_requirement_evidence(code, requirement):
             warnings.append('Harness may be missing a setup requirement that should stay valid while trigger controls are varied: {}.'.format(requirement))
-            score -= 4
+            score -= 2 if leak_vuln else 4
 
     if 'setjmp(' in code and 'abort()' in code:
         violations.append('Harness uses setjmp-style error recovery but still aborts in an error callback, which can cause false positive crashes.')
         score -= 20
+        critical = True
 
     null_helper_issues = _find_suspicious_null_helper_calls(code, construction_plan)
     for issue in null_helper_issues:
@@ -862,28 +944,37 @@ def validate_harness_source(plan_path, source_path):
         score -= 20
 
     if construction_plan.get('support_object_construction') and not _has_support_object_construction_evidence(code, construction_plan.get('support_object_construction', [])):
-        violations.append('Harness shows weak evidence of constructing the required support object fields before the sink path is exercised.')
-        score -= 18
+        if parser_entry or leak_vuln:
+            warnings.append('Harness shows weak evidence of constructing the required support object fields before the sink path is exercised ({} - may not be needed).'.format(
+                'leak vulnerability' if leak_vuln else 'parser entry'))
+            score -= 6
+        else:
+            violations.append('Harness shows weak evidence of constructing the required support object fields before the sink path is exercised.')
+            score -= 18
 
     null_callback_setups = _find_null_callback_setup_calls(code)
     if null_callback_setups and any(role.get('role') == 'state' for role in parameter_roles) and failure_path_indicators.get('error_calls') and 'setjmp(' not in code:
-        violations.append('Harness appears to create state through setup-style calls with repeated NULL/nullptr callback placeholders and no local error recovery: {}. Install non-fatal callback handling or equivalent error containment in the harness.'.format(', '.join(null_callback_setups)))
-        score -= 25
+        if parser_entry:
+            warnings.append('Harness creates state through setup-style calls with NULL/nullptr placeholders and no local error recovery (parser entry - NULL args may be valid defaults): {}.'.format(', '.join(null_callback_setups)))
+            score -= 8
+        else:
+            violations.append('Harness appears to create state through setup-style calls with repeated NULL/nullptr callback placeholders and no local error recovery: {}. Install non-fatal callback handling or equivalent error containment in the harness.'.format(', '.join(null_callback_setups)))
+            score -= 25
 
     milestone_kinds = set([item.get('kind') for item in milestone_plan if item.get('required')])
     if 'object-lifecycle' in milestone_kinds and not (_mentions_any(code, setup_candidates) or _has_generic_state_setup(code)):
         violations.append('Milestone plan requires valid state creation before sink-oriented fuzzing, but the harness shows no plausible setup or object-lifecycle construction.')
         score -= 20
 
-    if 'container-parse' in milestone_kinds and input_model.get('primary') == 'structured-format' and not _has_structured_container_shaping(code, entry_function):
+    if not parser_entry and 'container-parse' in milestone_kinds and input_model.get('primary') == 'structured-format' and not _has_structured_container_shaping(code, entry_function):
         violations.append('Milestone plan requires the library to accept a minimally valid structured container before the sink can be live, but the harness shows no plausible container shaping.')
         score -= 20
 
-    if 'incremental-feed' in milestone_kinds and not _has_loop(code):
+    if 'incremental-feed' in milestone_kinds and not _has_loop(code) and not parser_entry:
         violations.append('Milestone plan requires repeated feed or update progress before the sink is likely to execute, but the harness has no obvious bounded incremental flow.')
         score -= 18
 
-    if 'transform-gating' in milestone_kinds and not _has_transform_configuration(code):
+    if 'transform-gating' in milestone_kinds and not _has_transform_configuration(code, support_keywords):
         warnings.append('Milestone plan suggests sink-adjacent transform or configuration state is required, but the harness shows no obvious transform-configuration step.')
         score -= 6
 
@@ -904,18 +995,20 @@ def validate_harness_source(plan_path, source_path):
             'sink_activation_conditions',
             'milestone_hints',
         ])
-        if has_transform_obligation and not _has_transform_configuration(code):
+        if has_transform_obligation and not _has_transform_configuration(code, support_keywords):
             warnings.append('Deferred transform-stage obligations were inferred, but the harness shows no obvious later-stage transform or configuration step after parser or setup milestones.')
             score -= 6
         empty_callbacks = _find_empty_transform_callbacks(code, callback_names, transform_api_names)
         if empty_callbacks:
             violations.append('Deferred transform-stage callbacks are registered but do not execute the required transform work: {}. Place the deferred transform APIs inside the callback or stage-transition body that owns this stage.'.format(', '.join(empty_callbacks)))
             score -= 20
+            critical = True
         early_transform_calls = _find_early_transform_calls(code, entry_function, transform_api_names, callback_names)
         if early_transform_calls:
             violations.append('Deferred transform-stage APIs appear before the first public entry invocation instead of executing at a later callback or post-parse transition site: {}.'.format(', '.join(early_transform_calls)))
             score -= 20
-        dead_support_state = _find_dead_support_state_names(code)
+            critical = True
+        dead_support_state = _find_dead_support_state_names(code, support_keywords)
         if dead_support_state:
             warnings.append('Harness populates support-like staged state that is never consumed by any helper or transform call: {}.'.format(', '.join(dead_support_state)))
             score -= 6
@@ -926,7 +1019,7 @@ def validate_harness_source(plan_path, source_path):
 
     mutable_regions = active_data_plan.get('mutable_regions', [])
     high_priority_names = [item.get('name') for item in mutable_regions if item.get('priority') == 'high']
-    if high_priority_names and _looks_like_trailing_append_only(code) and not _has_data_driven_support_object(code):
+    if high_priority_names and _looks_like_trailing_append_only(code) and not _has_data_driven_support_object(code, support_keywords):
         violations.append('Active data plan expects sink-relevant mutation placement, but the harness appears to spend entropy on trailing appended bytes without driving high-value mutable regions such as {}.'.format(', '.join(high_priority_names[:4])))
         score -= 20
 
@@ -934,7 +1027,7 @@ def validate_harness_source(plan_path, source_path):
         violations.append('Active data plan says decoded work units should carry fuzz entropy, but the harness appears to append raw bytes after a finished body instead of mutating post-parse work-unit contents.')
         score -= 18
 
-    if any(item.get('kind') in ['table', 'config'] for item in mutable_regions) and not _has_data_driven_support_object(code):
+    if any(item.get('kind') in ['table', 'config'] for item in mutable_regions) and not _has_data_driven_support_object(code, support_keywords):
         warnings.append('Active data plan suggests support tables or configuration should be fuzz-driven within valid bounds, but the harness appears to keep them constant.')
         score -= 6
 
@@ -947,8 +1040,15 @@ def validate_harness_source(plan_path, source_path):
             warnings.append('Harness shows weak evidence that it preserves an inferred trigger invariant: {}.'.format(requirement))
             score -= 4
 
+    # A harness passes if no critical violation was found AND the score
+    # stays above the acceptance threshold.  This avoids false rejections
+    # caused by minor plan-mismatch violations while still catching
+    # genuinely broken harnesses (missing entry call, setjmp+abort, etc.).
+    _SCORE_THRESHOLD = 60
+    passed = (not critical) and (max(0, score) >= _SCORE_THRESHOLD)
+
     return {
-        'ok': len(violations) == 0,
+        'ok': passed,
         'score': max(0, score),
         'violations': violations,
         'warnings': warnings,
@@ -997,6 +1097,18 @@ def run_runtime_smoke(harness_binary, out_dir, plan_path=None):
     combined = (result.stdout or '') + '\n' + (result.stderr or '')
     evidence = classify_runtime_evidence(plan_path, combined, result.returncode) if plan_path else {}
     if result.returncode != 0:
+        # A crash that reaches the sink or sink-adjacent path means the
+        # harness is working — even trivial inputs can trigger certain bugs.
+        # Treat this as success rather than requesting a repair.
+        ev_score = evidence.get('score', 0) if evidence else 0
+        if ev_score >= 80:
+            return {
+                'ok': True,
+                'issue': '',
+                'output': combined[:4000],
+                'evidence': evidence,
+                'vulnerability_triggered': True,
+            }
         return {
             'ok': False,
             'issue': 'Harness crashed or exited abnormally on trivial runtime probe inputs.',

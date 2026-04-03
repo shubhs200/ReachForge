@@ -185,6 +185,19 @@ def run_seed_corpus_validation(harness_binary: Path, out_dir: Path, plan_path: P
     combined = (result.stdout or '') + '\n' + (result.stderr or '')
     evidence = classify_runtime_evidence(plan_path, combined, result.returncode)
     if result.returncode != 0:
+        # A crash that reaches the sink or sink-adjacent functions means the
+        # harness *successfully triggered the vulnerability* — that is not a
+        # harness defect, so treat it as a pass.
+        ev_score = evidence.get('score', 0) if evidence else 0
+        if ev_score >= 80:
+            return {
+                'ok': True,
+                'issue': '',
+                'output': combined[:6000],
+                'evidence': evidence,
+                'seed_count': seed_count,
+                'vulnerability_triggered': True,
+            }
         return {
             'ok': False,
             'issue': 'Harness crashed or exited abnormally on generated targeted seeds.',
@@ -235,6 +248,7 @@ def select_best_candidate(plan_path: Path, candidates_dir: Path, variants, model
 
     reports.sort(
         key=lambda item: (
+            item.get('ok', False),
             item.get('score', 0),
             sum(1 for rel in item.get('relation_diagnostics', []) if rel.get('ok')),
             -len(item.get('violations', [])),
@@ -264,6 +278,10 @@ def detect_build_system(root: Path) -> str:
         return "meson"
     if (root / "configure").exists():
         return "autotools"
+    # Recognise autotools projects that have configure.ac/configure.in but
+    # no pre-generated configure script (needs autoreconf / bootstrap first).
+    if (root / "configure.ac").exists() or (root / "configure.in").exists():
+        return "autotools"
     return "unknown"
 
 def build_manual_autotools(root: Path, log_path: Path, script_dir: Path) -> int:
@@ -281,6 +299,10 @@ def build_manual_autotools(root: Path, log_path: Path, script_dir: Path) -> int:
     env["CXX"] = str(script_dir / "rf-cxx")
     env["CFLAGS"] = "-fsanitize=address,undefined -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
     env["CXXFLAGS"] = env["CFLAGS"]
+    # Disable leak detection during build — build tools (parser generators,
+    # code generators, etc.) commonly leak memory and ASAN would otherwise
+    # abort the build.  This mirrors standard oss-fuzz practice.
+    env["ASAN_OPTIONS"] = "detect_leaks=0"
     
     # Run configure - skip autoreconf if configure already exists
     configure_script = root / "configure"
@@ -291,18 +313,35 @@ def build_manual_autotools(root: Path, log_path: Path, script_dir: Path) -> int:
             result = subprocess.run(["bash", "./autogen.sh"], cwd=str(root), env=env)
             if result.returncode != 0:
                 return result.returncode
+        elif (root / "bootstrap").exists():
+            print("Running bootstrap...")
+            result = subprocess.run(["bash", "./bootstrap"], cwd=str(root), env=env)
+            if result.returncode != 0:
+                return result.returncode
+        elif (root / "buildconf").exists():
+            print("Running buildconf...")
+            result = subprocess.run(["bash", "./buildconf"], cwd=str(root), env=env)
+            if result.returncode != 0:
+                return result.returncode
         elif os.path.exists("/usr/bin/autoreconf"):
             print("Running autoreconf...")
             result = subprocess.run(["autoreconf", "-fvi"], cwd=str(root), env=env)
             if result.returncode != 0:
                 return result.returncode
     
-    # Run configure
+    # Run configure with --disable-shared for static-only builds (preferred
+    # for fuzzing — avoids DSO linking issues and produces self-contained
+    # harness binaries).
+    configure_args = ["./configure", "--disable-shared"]
     if configure_script.exists():
-        print("Running configure...")
-        result = subprocess.run(["./configure"], cwd=str(root), env=env)
+        print("Running: " + " ".join(configure_args))
+        result = subprocess.run(configure_args, cwd=str(root), env=env)
         if result.returncode != 0:
-            return result.returncode
+            # Fall back to plain configure without --disable-shared
+            print("configure --disable-shared failed, retrying without it...")
+            result = subprocess.run(["./configure"], cwd=str(root), env=env)
+            if result.returncode != 0:
+                return result.returncode
     
     # Build with make
     make_cmd = ["make", "-j4"]
@@ -347,6 +386,8 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
     env["REAL_CXX"] = env.get("CXX", "clang++")
     env["CC"] = str(script_dir / "rf-cc")
     env["CXX"] = str(script_dir / "rf-cxx")
+    # Disable leak detection during build (see build_manual_autotools).
+    env["ASAN_OPTIONS"] = "detect_leaks=0"
     
     # CMake configure with instrumentation flags
     cflags = "-fsanitize=address,undefined -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
@@ -354,7 +395,9 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
         "cmake", "..",
         "-DCMAKE_C_FLAGS=" + cflags,
         "-DCMAKE_CXX_FLAGS=" + cflags,
-        "-DCMAKE_BUILD_TYPE=Debug"
+        "-DCMAKE_BUILD_TYPE=Debug",
+        "-DBUILD_TESTING=OFF",
+        "-DBUILD_SHARED_LIBS=OFF",
     ]
     
     # Enable cJSON_Utils if needed
@@ -371,16 +414,47 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
     make_cmd = ["make", "-j4"]
     print("Running: " + " ".join(make_cmd))
     result = subprocess.run(make_cmd, cwd=str(build_dir), env=env)
+    if result.returncode != 0:
+        # Partial-build fallback: if the library .a was produced, treat as success
+        import glob
+        static_libs = glob.glob(str(build_dir / "**" / "lib*.a"), recursive=True)
+        if static_libs:
+            print("WARNING: make failed (rc=" + str(result.returncode) + ") but static library found: " + static_libs[0])
+            print("Treating as partial build success (non-library targets may have failed).")
+            return 0
+        return result.returncode
     return result.returncode
 
 def main():
     p = argparse.ArgumentParser(description="Standalone harness generator for OSS-Fuzz library vulnerabilities")
     p.add_argument("--root", required=True, help="Project root under $SRC")
     p.add_argument("--build-script", required=False, help="Build script to run")
-    p.add_argument("--vulns", required=True, help="Path to vulnerabilities.json")
+    p.add_argument("--vulns", required=False, help="Path to vulnerabilities.json (optional if --cve-id and --package are provided)")
     p.add_argument("--cve-id", required=True, help="CVE ID to target")
+    p.add_argument("--package", required=False, help="Package name (required when --vulns is not provided)")
     p.add_argument("--out", required=True, help="Output directory for harness artifacts")
+    p.add_argument("--no-enrich", action="store_true",
+                   help="Skip automatic CVE enrichment from NVD/OSV/GitHub")
     args = p.parse_args()
+
+    # Build or load vulnerability entry
+    if args.vulns:
+        vulns_file = Path(args.vulns)
+    else:
+        # No vulnerabilities.json — construct a minimal entry from CLI args
+        if not args.package:
+            p.error("--package is required when --vulns is not provided")
+        minimal_entry = {"cve-id": args.cve_id, "package-name": args.package}
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        generated_vulns = out / "vulnerabilities.json"
+        generated_vulns.write_text(
+            json.dumps({"vulnerabilities": [minimal_entry]}, indent=2),
+            encoding="utf-8"
+        )
+        args.vulns = str(generated_vulns)
+        vulns_file = generated_vulns
+        print("[harness_runner] Generated minimal vulnerabilities.json from --cve-id and --package")
 
     root = Path(args.root).resolve()
     out = Path(args.out)
@@ -443,12 +517,41 @@ def main():
             if rc.returncode != 0:
                 sys.exit(rc.returncode)
 
+    # 1.5) CVE enrichment — query NVD/OSV/GitHub for descriptions, patches, CVSS
+    effective_vulns = args.vulns
+    if not args.no_enrich:
+        try:
+            from cve_enrichment import enrich_vulnerability
+            vulns_data = json.loads(Path(args.vulns).read_text(encoding="utf-8"))
+            vulns_list = vulns_data.get("vulnerabilities", vulns_data.get("vulns", []))
+            target_entry = next((v for v in vulns_list if v.get("cve-id") == args.cve_id), None)
+            if target_entry:
+                cache_dir = out / "enrichment_cache"
+                enriched_entry = enrich_vulnerability(target_entry, cache_dir=cache_dir)
+                # Replace the target entry in the list
+                enriched_list = []
+                for v in vulns_list:
+                    if v.get("cve-id") == args.cve_id:
+                        enriched_list.append(enriched_entry)
+                    else:
+                        enriched_list.append(v)
+                enriched_vulns_path = out / "enriched_vulnerabilities.json"
+                enriched_vulns_path.write_text(
+                    json.dumps({"vulnerabilities": enriched_list}, indent=2),
+                    encoding="utf-8"
+                )
+                effective_vulns = str(enriched_vulns_path)
+                print("[enrichment] Enriched vulnerabilities written to {}".format(enriched_vulns_path))
+        except Exception as exc:
+            print("[enrichment] Warning: CVE enrichment failed ({}), proceeding with original data".format(exc),
+                  file=sys.stderr)
+
     # 2) Generate harness plan
     plan_path = out / "harness_plan.json"
     subprocess.run([
         sys.executable, str(script_dir / "harness_plan.py"),
         "--root", str(root),
-        "--vulns", args.vulns,
+        "--vulns", effective_vulns,
         "--cve-id", args.cve_id,
         "--log", str(log_path),
         "--out", str(plan_path)
@@ -518,7 +621,14 @@ def main():
                     print("Semantic validation failed after all retries:", file=sys.stderr)
                     print(json.dumps(semantic_report, indent=2), file=sys.stderr)
                     sys.exit(1)
-            print("LLM semantic repair failed: " + msg)
+                # LLM repair succeeded and validation now passes
+                print("LLM semantic repair succeeded (attempt " + str(attempt+1) + ")")
+            else:
+                print("LLM semantic repair failed: " + msg)
+                if attempt < max_retries - 1:
+                    continue
+                print("All semantic repair attempts exhausted", file=sys.stderr)
+                sys.exit(1)
 
         result = subprocess.run([
             sys.executable, str(script_dir / "compile_harness.py"),
@@ -566,6 +676,10 @@ def main():
             runtime_target = out / binary_name if (out / binary_name).exists() else harness_binary
             runtime_report = run_runtime_smoke(runtime_target, out, plan_path)
             (out / 'context' / 'runtime_smoke_report.json').write_text(json.dumps(runtime_report, indent=2), encoding='utf-8')
+            if runtime_report.get('vulnerability_triggered'):
+                ev = runtime_report.get('evidence', {})
+                print('Smoke test triggered the vulnerability ({}, score={}) -- harness is correct, skipping repair.'.format(
+                    ev.get('classification', 'unknown'), ev.get('score', 0)))
             if not runtime_report.get('ok'):
                 if attempt < max_retries - 1:
                     current_code = fuzzer_src.read_text(encoding="utf-8")
@@ -610,6 +724,10 @@ def main():
             if seeds_path:
                 seed_report = run_seed_corpus_validation(runtime_target, out, plan_path)
                 (out / 'context' / 'seed_runtime_report.json').write_text(json.dumps(seed_report, indent=2), encoding='utf-8')
+                if seed_report.get('vulnerability_triggered'):
+                    ev = seed_report.get('evidence', {})
+                    print('Seeds triggered the vulnerability ({}, score={}) -- harness is correct, skipping repair.'.format(
+                        ev.get('classification', 'unknown'), ev.get('score', 0)))
                 if not seed_report.get('ok'):
                     if attempt < max_retries - 1:
                         current_code = fuzzer_src.read_text(encoding='utf-8')

@@ -114,10 +114,6 @@ class LLVMCallGraphBuilder:
         if not params_str or params_str.strip() == '':
             return params
         
-        # Debug: show what we're trying to parse
-        if len(params_str) < 200:
-            print("DEBUG LLVM _parse_params: '" + str(params_str[:100]) + "'")
-        
         # Split by comma, handling nested types like %struct.foo*, [10 x i8], etc.
         depth = 0
         current = ''
@@ -165,7 +161,15 @@ class LLVMCallGraphBuilder:
                 # Skip align N, dereferenceable(N)
                 if token in ['align', 'dereferenceable', 'dereferenceable_or_null']:
                     break  # Rest is alignment info
-                if token.startswith('%'):
+                if token.startswith('%') and (
+                    token.startswith('%struct.') or
+                    token.startswith('%union.') or
+                    token.startswith('%class.') or
+                    token.startswith('%"')
+                ):
+                    # Named LLVM type references — these are types, not param names
+                    param_type_parts.append(token)
+                elif token.startswith('%'):
                     param_name = token[1:]  # Remove %
                     break
                 else:
@@ -177,6 +181,11 @@ class LLVMCallGraphBuilder:
             elif param_name:
                 # Type might be empty (uncommon but possible)
                 pass
+            elif param_type_parts:
+                # No %name token — e.g. unnamed/numbered IR params.
+                # Assign a positional name so downstream analysis still works.
+                param_type = ' '.join(param_type_parts)
+                params.append((param_type, 'param_' + str(len(params))))
         
         return params
 
@@ -215,9 +224,9 @@ class LLVMCallGraphBuilder:
         """Check if a type string represents a data pointer (not struct/function pointer)."""
         if not type_str:
             return False
-        # Data pointers: i8*, char*, void*, i8* nocapture, etc.
+        # Data pointers: i8*, char*, void*, i8* nocapture, ptr (opaque), etc.
         # Not data pointers: %struct.XXX*, %class.XXX*, i32 (...)*
-        type_lower = type_str.lower()
+        type_lower = type_str.lower().strip()
         
         # Check for struct/class pointer (internal types)
         if '%struct' in type_str or '%class' in type_str or '%union' in type_str:
@@ -226,6 +235,10 @@ class LLVMCallGraphBuilder:
         # Check for function pointer
         if '...' in type_str:
             return False
+        
+        # LLVM opaque pointer mode (LLVM 15+): bare 'ptr' is a generic pointer
+        if type_lower == 'ptr':
+            return True
         
         # Check for data pointer patterns
         data_ptr_patterns = [
@@ -350,14 +363,8 @@ class LLVMCallGraphBuilder:
                 paren_start = line.find('(')
                 if paren_start != -1:
                     params_str = self._extract_balanced_parens(line, paren_start)
-                    # Debug for specific functions
-                    if func_name in ['XML_Parse', 'doProlog', 'doContent']:
-                        print("DEBUG LLVM: Found " + func_name + " def, line: " + str(line[:80]) + "...")
-                        print("DEBUG LLVM: params_str for " + func_name + ": '" + str(params_str[:80] if params_str else '') + "'")
                 else:
                     params_str = ''
-                    if func_name in ['XML_Parse', 'doProlog', 'doContent']:
-                        print("DEBUG LLVM: Found " + func_name + " but NO parens!")
                 
                 params = self._parse_params(params_str)
                 self.functions[func_name] = {'defined': True, 'location': location, 'params': params}
@@ -374,14 +381,8 @@ class LLVMCallGraphBuilder:
                 paren_start = line.find('(')
                 if paren_start != -1:
                     params_str = self._extract_balanced_parens(line, paren_start)
-                    # Debug for specific functions
-                    if func_name in ['XML_Parse', 'doProlog', 'doContent']:
-                        print("DEBUG LLVM: Found " + func_name + " DECL, line: " + str(line[:80]) + "...")
-                        print("DEBUG LLVM: params_str for " + func_name + " decl: '" + str(params_str[:80] if params_str else '') + "'")
                 else:
                     params_str = ''
-                    if func_name in ['XML_Parse', 'doProlog', 'doContent']:
-                        print("DEBUG LLVM: Found " + func_name + " DECL but NO parens!")
                 
                 params = self._parse_params(params_str)
                 if func_name not in self.functions:
@@ -563,39 +564,8 @@ class LLVMCallGraphBuilder:
         print("DEBUG LLVM: Found " + str(len(self.indirect_calls)) + " indirect calls")
         print("DEBUG LLVM: Found " + str(len(self.address_taken)) + " address-taken functions")
         
-        # Debug: show specific functions we care about
-        for func in ['contentProcessor', 'prologProcessor', 'doContent']:
-            if func in self.address_taken:
-                print("DEBUG LLVM: " + func + " is address-taken at: " + str(self.address_taken[func][:2]))
-            else:
-                print("DEBUG LLVM: " + func + " is NOT address-taken")
-        
-        # Debug: show first few store targets
-        print("DEBUG LLVM: Sample pointer_targets: " + str(dict(list(self.pointer_targets.items())[:5])))
-        
         # Resolve function pointers
         self.resolve_function_pointers()
-        
-        # Debug: show data params for key functions
-        for func in ['XML_Parse', 'XML_FreeContentModel', 'doProlog', 'doContent']:
-            data_params = self.get_data_params(func)
-            all_params = self.func_params.get(func, [])
-            print("DEBUG LLVM: " + func + " params: " + str(all_params[:3]) + " -> data_params: " + str(data_params))
-        
-        # Debug: show all functions that start with "XML" or contain "Parse"
-        xml_funcs = [f for f in self.functions if 'XML' in f or 'arse' in f or 'arse' in f.lower()]
-        print("DEBUG LLVM: Functions with 'XML' or 'Parse': " + str(xml_funcs[:10]))
-        
-        # Debug: show params for all XML_ functions
-        for func in xml_funcs[:5]:
-            print("DEBUG LLVM: " + func + " -> params: " + str(self.func_params.get(func, [])[:2]))
-        
-        # Debug: Check functions in callgraph but not in func_params
-        all_callgraph_funcs = set(self.adjacency.keys())
-        for callees in self.adjacency.values():
-            all_callgraph_funcs.update(callees)
-        missing_params = [f for f in all_callgraph_funcs if f not in self.func_params and f.startswith('XML')]
-        print("DEBUG LLVM: XML functions in callgraph but missing params: " + str(missing_params[:10]))
         
         # Convert to expected format
         adjacency = {caller: list(callees) for caller, callees in self.adjacency.items()}
@@ -706,6 +676,83 @@ class LLVMCallGraphBuilder:
         
         return score
 
+    def trace_parameter_flow(self, path):
+        """Trace data flow from entry to sink along *path*.
+
+        Returns a dict with:
+          entry_params            – [(type, name), …] for the entry function
+          sink_params             – [(type, name), …] for the sink function
+          entry_controlled_at_sink – {sink_param_idx: (entry_param_idx, entry_param_name)}
+          sink_internal_params    – [name, …] for sink params with NO entry source
+        """
+        if not path or len(path) < 2:
+            return {}
+
+        entry_func = path[0]
+        sink_func = path[-1]
+        entry_params = self.func_params.get(entry_func, [])
+        sink_params = self.func_params.get(sink_func, [])
+
+        if not entry_params or not sink_params:
+            return {}
+
+        # Start with entry data + control param indices as tainted.
+        entry_data = self.get_data_params(entry_func)
+        entry_ctrl = self.get_control_params(entry_func)
+        tainted = set(entry_data + entry_ctrl)
+
+        if not tainted:
+            # Nothing flows in — every sink param is internal.
+            return {
+                'entry_params': list(entry_params),
+                'sink_params': list(sink_params),
+                'entry_controlled_at_sink': {},
+                'sink_internal_params': [p[1] for p in sink_params],
+            }
+
+        # Keep a mapping tainted_param_idx → originating entry_param_idx
+        # so we can report which entry param reaches which sink param.
+        origin = {idx: idx for idx in tainted}
+
+        for hop in range(len(path) - 1):
+            caller = path[hop]
+            callee = path[hop + 1]
+            edge_flow = self.get_edge_param_flow(caller, callee)
+            if not edge_flow:
+                # Flow unknown at this hop — conservatively lose all taint.
+                tainted = set()
+                origin = {}
+                break
+
+            next_tainted = set()
+            next_origin = {}
+            for caller_idx, callee_idx in edge_flow:
+                if caller_idx in tainted:
+                    next_tainted.add(callee_idx)
+                    next_origin[callee_idx] = origin[caller_idx]
+
+            tainted = next_tainted
+            origin = next_origin
+
+        # Build result
+        controlled = {}
+        for sink_idx, entry_idx in origin.items():
+            if sink_idx < len(sink_params):
+                controlled[sink_idx] = (entry_idx,
+                                        entry_params[entry_idx][1] if entry_idx < len(entry_params) else '?')
+
+        internal = []
+        for i, (_, pname) in enumerate(sink_params):
+            if i not in controlled:
+                internal.append(pname)
+
+        return {
+            'entry_params': list(entry_params),
+            'sink_params': list(sink_params),
+            'entry_controlled_at_sink': controlled,
+            'sink_internal_params': internal,
+        }
+
 
 def find_ll_files(root_dir: str) -> List[str]:
     """Find all .ll files under root directory."""
@@ -794,6 +841,69 @@ def _fill_missing_params_from_headers(log_path: str, root_dir: str):
     except Exception as e:
         print("DEBUG LLVM: Failed to extract from headers: " + str(e))
 
+    # Second pass: extract params from .c source files for functions still missing.
+    still_missing = [f for f in all_callgraph_funcs
+                     if f not in _builder_instance.func_params
+                     or not _builder_instance.func_params.get(f)]
+    if still_missing:
+        _fill_params_from_source(still_missing, root_dir)
+
+
+def _resolve_ll_to_source_path(ll_path: str, root_dir: str) -> str:
+    """Resolve an .ll file path to the corresponding .c/.cpp source, simple glob."""
+    import glob as _glob
+    p = ll_path.split(':')[0] if ':' in ll_path else ll_path
+    if not p.endswith('.ll'):
+        return p
+    base = os.path.splitext(os.path.basename(p))[0]
+    for ext in ('*.c', '*.cc', '*.cpp', '*.cxx'):
+        for src in _glob.glob(os.path.join(root_dir, '**', ext), recursive=True):
+            if os.path.splitext(os.path.basename(src))[0] == base:
+                return src
+    return ''
+
+
+def _fill_params_from_source(func_names, root_dir):
+    """Fill func_params for internal functions by parsing their .c source files."""
+    global _builder_instance
+    if _builder_instance is None:
+        return
+
+    try:
+        from vuln_analyzer import extract_function_parameters, extract_function_source
+        from pathlib import Path
+    except ImportError:
+        return
+
+    # Group functions by source file to avoid re-reading the same file
+    file_funcs = {}  # source_path -> [func_name, ...]
+    for func_name in func_names:
+        info = _builder_instance.functions.get(func_name, {})
+        loc = info.get('location', '')
+        if not loc:
+            continue
+        src = _resolve_ll_to_source_path(loc, root_dir)
+        if src and os.path.exists(src):
+            file_funcs.setdefault(src, []).append(func_name)
+
+    filled = 0
+    for src_path, funcs in file_funcs.items():
+        try:
+            content = open(src_path, 'r', encoding='utf-8', errors='ignore').read()
+        except Exception:
+            continue
+        for func_name in funcs:
+            params_list = extract_function_parameters(content, func_name)
+            if params_list:
+                # Convert [{'name': ..., 'type': ...}] → [(type, name)]
+                tuples = [(p.get('type', 'unknown'), p['name']) for p in params_list if p.get('name')]
+                if tuples:
+                    _builder_instance.func_params[func_name] = tuples
+                    filled += 1
+
+    if filled:
+        print("DEBUG LLVM: Filled params for " + str(filled) + " functions from .c source")
+
 def score_path_taint(path):
     """
     Score a path using the global builder instance.
@@ -818,6 +928,14 @@ def get_data_params(func_name):
     if _builder_instance is None:
         return []
     return _builder_instance.get_data_params(func_name)
+
+
+def trace_parameter_flow(path):
+    """Trace entry→sink parameter flow using the global builder instance."""
+    global _builder_instance
+    if _builder_instance is None:
+        return {}
+    return _builder_instance.trace_parameter_flow(path)
 
 
 def find_public_wrapper(adjacency, usr_to_file, sink_name, public_names):

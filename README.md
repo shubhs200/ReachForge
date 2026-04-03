@@ -18,6 +18,12 @@ vulnerabilities.json + library source
 └────────┬─────────┘
          ▼
 ┌──────────────────┐
+│  cve_enrichment   │  Queries NVD, OSV, GitHub Advisory APIs
+│                    │  Retrieves: description, CVSS, fix patches, refs
+│                    │  Cached in out/enrichment_cache/
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
 │  harness_plan     │  LLVM IR callgraph → BFS from sink to public API
 │                    │  vuln_analyzer + contract_inference + stage_retrieval
 │                    │  Selects entry point, extracts parameter roles,
@@ -26,9 +32,9 @@ vulnerabilities.json + library source
          ▼
 ┌──────────────────┐
 │  prompt_harness   │  Builds structured LLM prompt with:
-│                    │  - CWE-specific guidance
+│                    │  - CVE description + fix patch diffs (from enrichment)
+│                    │  - Vulnerability-directed strategy synthesis
 │                    │  - Call-path semantic analysis
-│                    │  - CVE description (if provided)
 │                    │  - Forbidden patterns
 └────────┬─────────┘
          ▼
@@ -71,6 +77,20 @@ docker run -it --rm \
 # 2. Inside the container, run the pipeline
 python3 /src/reachforge/harness_runner.py \
   --root /src/<library> \
+  --cve-id CVE-XXXX-XXXXX \
+  --package <library-name> \
+  --out /out/reachforge
+```
+
+You only need the CVE ID and package name. The tool automatically retrieves
+the vulnerability description, CWE classification, affected function, affected
+file, and fix patches from NVD/OSV/GitHub APIs.
+
+Alternatively, provide a `vulnerabilities.json` for more control:
+
+```bash
+python3 /src/reachforge/harness_runner.py \
+  --root /src/<library> \
   --vulns /src/<library>/vulnerabilities.json \
   --cve-id CVE-XXXX-XXXXX \
   --out /out/reachforge
@@ -85,8 +105,8 @@ docker run -it --rm \
   gcr.io/oss-fuzz/libpng \
   python3 /src/reachforge/harness_runner.py \
     --root /src/libpng \
-    --vulns /src/libpng/vulnerabilities.json \
     --cve-id CVE-2025-64505 \
+    --package libpng \
     --out /out/reachforge
 ```
 
@@ -106,9 +126,9 @@ libxml2, sqlite3, zlib
 
 ---
 
-## vulnerabilities.json Format
+## vulnerabilities.json Format (Optional)
 
-Each target library needs a `vulnerabilities.json` file:
+When using `--vulns`, each target library needs a `vulnerabilities.json` file:
 
 ```json
 {
@@ -126,9 +146,12 @@ Each target library needs a `vulnerabilities.json` file:
 }
 ```
 
-**Required fields**: `cve-id`, `package-name`, `affected-function`, `cwe-id`
-**Optional fields**: `description` (improves harness quality significantly),
-`package-version`, `affected-file`
+**Required fields**: `cve-id`, `package-name`
+**Auto-derived fields** (populated from CVE enrichment if not provided):
+`cwe-id` (from NVD), `affected-function` (parsed from CVE description),
+`affected-file` (parsed from patch diff)
+**Optional fields**: `description` (auto-retrieved by CVE enrichment, or
+manually provided), `package-version`
 
 ---
 
@@ -150,6 +173,7 @@ Each target library needs a `vulnerabilities.json` file:
 |----------|-------------|
 | `OPENAI_API_KEY` | OpenAI API key (required) |
 | `LIB_FUZZING_ENGINE` | Path to fuzzer runtime library (set by OSS-Fuzz) |
+| `GITHUB_TOKEN` | GitHub token for higher API rate limits (optional) |
 
 ---
 
@@ -159,32 +183,40 @@ Each target library needs a `vulnerabilities.json` file:
    CC/CXX, logging compile commands to JSONL and generating LLVM IR (`.ll` files)
    with ASAN/UBSAN/fuzzer-no-link instrumentation.
 
-2. **Harness Planning** — Builds an LLVM IR callgraph (including indirect calls
+2. **CVE Enrichment** — Queries NVD, OSV.dev, and GitHub Advisory APIs to
+   automatically retrieve CVE descriptions, CVSS scores, fix commit hashes,
+   and patch diffs. Results cached in `out/enrichment_cache/`. Auto-populates
+   missing fields: `cwe-id` from NVD, `affected-function` from CVE description
+   parsing, `affected-file` from patch diff. Use `--no-enrich` to skip.
+
+3. **Harness Planning** — Builds an LLVM IR callgraph (including indirect calls
    via function pointer dispatch tables), finds all public APIs that reach the
    vulnerable function via BFS, selects the best entry point using taint-based
    scoring, and produces a detailed plan with parameter roles, execution hints,
    trigger conditions, and construction plans.
 
-3. **Prompt Building** — Constructs a structured LLM prompt with CWE-specific
-   test patterns, call-path semantic analysis, annotated source snippets,
-   contract obligations, and forbidden anti-patterns.
+4. **Prompt Building** — Constructs a structured LLM prompt with CVE description,
+   fix patch diffs (from enrichment), call-path semantic analysis, a vulnerability-directed
+   strategy synthesis section that forces the LLM to reason about what specific
+   inputs trigger the bug, annotated source snippets, contract obligations, and
+   forbidden anti-patterns.
 
-4. **LLM Harness Generation** — Sends 3 prompt variants to the LLM (temperature
+5. **LLM Harness Generation** — Sends 3 prompt variants to the LLM (temperature
    0.2), validates each candidate statically (100-point scoring with ~20 check
    categories), selects the best one.
 
-5. **Compilation** — Compiles the harness against the instrumented library,
+6. **Compilation** — Compiles the harness against the instrumented library,
    auto-detects extra link libraries (zlib, lzma, etc.) via `nm --undefined-only`.
 
-6. **Repair Loop** — Up to 3 attempts per failure mode:
+7. **Repair Loop** — Up to 3 attempts per failure mode:
    - Semantic validation failure → LLM fix prompt with specific violations
    - Compile failure → LLM fix prompt with compiler errors
    - Runtime smoke failure → LLM fix prompt with crash/timeout info
 
-7. **Seed Generation** — LLM generates targeted seed inputs based on the
-   vulnerability type, function source, and CWE guidance.
+8. **Seed Generation** — LLM generates targeted seed inputs based on the
+   vulnerability type, function source, and fix patch context.
 
-8. **Fuzzing** — Runs the compiled harness with the generated seed corpus.
+9. **Fuzzing** — Runs the compiled harness with the generated seed corpus.
 
 ---
 
@@ -194,9 +226,10 @@ Each target library needs a `vulnerabilities.json` file:
 ReachForge_tailored/
 ├── harness_runner.py      # Entry point — end-to-end orchestrator (733 lines)
 │
+├── cve_enrichment.py      # CVE enrichment via NVD/OSV/GitHub APIs (310)
 ├── build_capture.py       # Build interception, sets CC/CXX to rf-cc/rf-cxx (94)
 ├── harness_plan.py        # Callgraph BFS, parameter roles, planning (2385)
-├── prompt_harness.py      # LLM prompt builder with CWE guidance (886)
+├── prompt_harness.py      # LLM prompt builder with strategy synthesis (886)
 ├── compile_harness.py     # Harness compilation, auto link-lib detection (825)
 ├── harness_validator.py   # Static validation + runtime smoke tests (1011)
 ├── seed_generator.py      # Seed generation via LLM (256)
@@ -220,8 +253,9 @@ ReachForge_tailored/
 ├── llm_adapters/
 │   ├── __init__.py
 │   └── openai.py          # Raw urllib OpenAI wrapper with retry logic (142)
-├── tests/                 # 78 tests across 5 files (2811 lines)
+├── tests/                 # 103 tests across 6 files
 │   ├── conftest.py
+│   ├── test_cve_enrichment.py
 │   ├── test_harness_runner.py
 │   ├── test_llvm_callgraph_context.py
 │   ├── test_contract_inference.py
@@ -230,7 +264,7 @@ ReachForge_tailored/
 └── oss-fuzz/              # OSS-Fuzz project definitions (used for Docker builds)
 ```
 
-**Total**: ~11,400 lines of pipeline code, ~2,800 lines of tests, 78 tests passing.
+**Total**: ~11,700 lines of pipeline code, ~3,100 lines of tests, 103 tests passing.
 
 ---
 
@@ -265,7 +299,21 @@ python3 -m pytest tests/ -v
   lzma_* prefixes, etc.).
 
 - **No hardcoded patterns**: Everything derived from static analysis of the
-  actual library source and LLVM IR. CWE guidance is generic, not library-specific.
+  actual library source and LLVM IR. No CWE-specific rules — the LLM infers
+  the correct testing strategy from the CVE description, fix patch, source code,
+  state fields, and call-path semantics.
+
+- **CVE enrichment (RAG)**: Automatic retrieval of CVE descriptions, CVSS scores,
+  fix patch diffs, and references from NVD/OSV/GitHub. Auto-populates missing
+  vulnerability fields (`cwe-id`, `affected-function`, `affected-file`) so only
+  `cve-id` and `package-name` are truly required. The patch diff is the
+  highest-value signal — it shows the LLM exactly which code paths were vulnerable
+  and what input conditions trigger the bug.
+
+- **Vulnerability-directed strategy synthesis**: The prompt includes a dedicated
+  section that combines the CVE description, static-analysis state fields, field
+  conditions, and trigger relations, forcing the LLM to reason step-by-step about
+  what specific input structure triggers the vulnerability before generating code.
 
 ---
 
@@ -281,6 +329,6 @@ python3 -m pytest tests/ -v
 - **Model dependency**: Uses raw `urllib` to call OpenAI API (no SDK). Rate
   limit retry: fixed 30s wait. Connection error retry: linear backoff.
 
-- **No automatic CVE description lookup**: The `description` field in
-  vulnerabilities.json must be manually added but significantly improves
-  harness quality.
+- **Enrichment requires network**: CVE enrichment needs outbound HTTPS to
+  NVD, OSV, and GitHub APIs. Use `--no-enrich` if running without network
+  access. Patch diff fetching requires GitHub commit URLs.
