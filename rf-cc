@@ -12,31 +12,83 @@ def main():
     
     # Build argv with instrumentation flags
     argv = [real_cc]
-    
-    # Add sanitizer + fuzzer flags for coverage instrumentation
-    sanitizer_flags = [
-        "-fsanitize=address,undefined",
-        "-fsanitize=fuzzer-no-link",
-        "-fno-omit-frame-pointer",
-        "-gline-tables-only",
-    ]
-    
+
+    # Add sanitizer + fuzzer flags for coverage instrumentation. Honour
+    # RF_SANITIZER_MODE=asan_only (set by build_capture when ASan+UBSan can't
+    # link on a legacy clang/libc++ toolchain) — adding both here would
+    # silently re-enable UBSan and break the fallback.
+    asan_only = os.getenv("RF_SANITIZER_MODE") == "asan_only"
+    if asan_only:
+        sanitizer_flags = [
+            "-fsanitize=address",
+            "-fno-sanitize-recover=all",
+            "-fsanitize=fuzzer-no-link",
+            "-fno-omit-frame-pointer",
+            "-gline-tables-only",
+        ]
+    else:
+        sanitizer_flags = [
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-fsanitize=fuzzer-no-link",
+            "-fno-omit-frame-pointer",
+            "-gline-tables-only",
+        ]
+
     # Add flags if not already present
     for flag in sanitizer_flags:
         if flag not in sys.argv:
             argv.append(flag)
-    
+
     # Add original arguments
     argv.extend(sys.argv[1:])
+
+    # On legacy clang+libc++ toolchains (e.g. clang 9 in OSS-Fuzz Ubuntu 16.04
+    # base images), `libclang_rt.asan_cxx-*.a` carries UBSan typeinfo refs to
+    # `__cxxabiv1::__class_type_info` etc. When the program is C-only the C++
+    # ABI lib isn't auto-linked and the link fails. Detect link-mode commands
+    # (have an output executable and no `-c`) and append C++ ABI/runtime libs
+    # by probing the filesystem so we use whatever is actually available.
+    # Library-agnostic.
+    is_compile_only = "-c" in sys.argv
+    has_o = any(a == "-o" for a in sys.argv)
+    looks_like_link = has_o and not is_compile_only
+    if looks_like_link:
+        # Avoid double-adding if user already specified.
+        already = set(argv)
+        # Prefer libc++abi (clang-based images, which is most of OSS-Fuzz).
+        # Fall back to libstdc++ if libc++abi isn't linkable. Probe via
+        # file existence: ld -l<name> needs lib<name>.{so,a} on the
+        # standard search path or an explicit -L. We check the most common
+        # paths. If neither is present, leave the link line alone.
+        cxx_abi_paths = [
+            "/usr/local/lib/libc++abi.so", "/usr/local/lib/libc++abi.a",
+            "/usr/lib/libc++abi.so", "/usr/lib/x86_64-linux-gnu/libc++abi.so",
+        ]
+        stdcxx_paths = [
+            "/usr/lib/x86_64-linux-gnu/libstdc++.so",
+            "/usr/lib/libstdc++.so", "/usr/local/lib/libstdc++.so",
+        ]
+        if any(os.path.exists(p) for p in cxx_abi_paths) and \
+                "-lc++abi" not in already and "-lc++" not in already:
+            argv.extend(["-lc++abi"])
+        elif any(os.path.exists(p) for p in stdcxx_paths) and \
+                "-lstdc++" not in already:
+            argv.append("-lstdc++")
     
     # Find source file and output file for LLVM IR emission
     src_file = None
     out_file = None
+    is_compile = False
     for i, arg in enumerate(sys.argv):
         if arg == '-c' and i + 1 < len(sys.argv):
             src_file = sys.argv[i + 1]
+            is_compile = True
         elif arg == '-o' and i + 1 < len(sys.argv):
             out_file = sys.argv[i + 1]
+    # Infer output when -o is absent (e.g. "cc -c file.c" produces file.o)
+    if src_file and not out_file and is_compile:
+        out_file = os.path.splitext(os.path.basename(src_file))[0] + '.o'
     
     # Log the command
     entry = {

@@ -10,33 +10,73 @@ def main():
     log_path = os.getenv("RF_BUILD_LOG", "rf_build_commands.jsonl")
     real_cxx = os.getenv("REAL_CXX", os.environ.get("CXX", "clang++"))
     
-    # Build argv with instrumentation flags
+    # Build argv with instrumentation flags. Honour RF_SANITIZER_MODE
+    # (mirrors build_capture's choice when ASan+UBSan can't link).
     argv = [real_cxx]
-    
-    # Add sanitizer + fuzzer flags for coverage instrumentation
-    sanitizer_flags = [
-        "-fsanitize=address,undefined",
-        "-fsanitize=fuzzer-no-link",
-        "-fno-omit-frame-pointer",
-        "-gline-tables-only",
-    ]
-    
+    asan_only = os.getenv("RF_SANITIZER_MODE") == "asan_only"
+    if asan_only:
+        sanitizer_flags = [
+            "-fsanitize=address",
+            "-fno-sanitize-recover=all",
+            "-fsanitize=fuzzer-no-link",
+            "-fno-omit-frame-pointer",
+            "-gline-tables-only",
+        ]
+    else:
+        sanitizer_flags = [
+            "-fsanitize=address,undefined",
+            "-fno-sanitize-recover=all",
+            "-fsanitize=fuzzer-no-link",
+            "-fno-omit-frame-pointer",
+            "-gline-tables-only",
+        ]
+
     # Add flags if not already present
     for flag in sanitizer_flags:
         if flag not in sys.argv:
             argv.append(flag)
-    
+
     # Add original arguments
     argv.extend(sys.argv[1:])
-    
+
+    # On legacy clang+libc++ toolchains (e.g. clang 9 in OSS-Fuzz Ubuntu 16.04
+    # base images), `libclang_rt.asan_cxx-*.a` and `libc++.a`'s
+    # `private_typeinfo.cpp` carry typeinfo refs to `__cxxabiv1::__class_type_info`.
+    # When linking we need `-lc++abi` (or `-lstdc++` if libc++abi isn't
+    # available) so those symbols resolve. Library-agnostic.
+    is_compile_only = "-c" in sys.argv
+    has_o = any(a == "-o" for a in sys.argv)
+    looks_like_link = has_o and not is_compile_only
+    if looks_like_link:
+        already = set(argv)
+        cxx_abi_paths = [
+            "/usr/local/lib/libc++abi.so", "/usr/local/lib/libc++abi.a",
+            "/usr/lib/libc++abi.so", "/usr/lib/x86_64-linux-gnu/libc++abi.so",
+        ]
+        stdcxx_paths = [
+            "/usr/lib/x86_64-linux-gnu/libstdc++.so",
+            "/usr/lib/libstdc++.so", "/usr/local/lib/libstdc++.so",
+        ]
+        if any(os.path.exists(p) for p in cxx_abi_paths) and \
+                "-lc++abi" not in already:
+            argv.extend(["-lc++abi"])
+        elif any(os.path.exists(p) for p in stdcxx_paths) and \
+                "-lstdc++" not in already:
+            argv.append("-lstdc++")
+
     # Find source file and output file for LLVM IR emission
     src_file = None
     out_file = None
+    is_compile = False
     for i, arg in enumerate(sys.argv):
         if arg == '-c' and i + 1 < len(sys.argv):
             src_file = sys.argv[i + 1]
+            is_compile = True
         elif arg == '-o' and i + 1 < len(sys.argv):
             out_file = sys.argv[i + 1]
+    # Infer output when -o is absent (e.g. "cc -c file.c" produces file.o)
+    if src_file and not out_file and is_compile:
+        out_file = os.path.splitext(os.path.basename(src_file))[0] + '.o'
     
     # Log the command
     entry = {
