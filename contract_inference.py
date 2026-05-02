@@ -13,11 +13,14 @@ NULL_LIKE_VALUES = {'null', 'nullptr', 'z_null', '0'}
 SIZE_FIELD_TOKENS = ['max', 'size', 'len', 'length', 'count', 'capacity', 'limit']
 POINTER_FIELD_TOKENS = ['buf', 'buffer', 'data', 'row', 'rows', 'extra', 'table', 'palette', 'image', 'out', 'dst', 'src']
 GENERIC_STATE_OWNERS = {'state', 'strm', 'stream', 'ctx', 'context', 'self', 'this'}
-DIRECT_STATE_FIELDS = {
+_IO_BOOKKEEPING_FIELDS = {
     'next_in', 'next_out', 'avail_in', 'avail_out', 'msg', 'adler', 'data_type',
-    'total_in', 'total_out', 'opaque', 'state', 'zalloc', 'zfree', 'reserved',
-    'length', 'mode', 'wrap', 'flags', 'check',
+    'total_in', 'total_out', 'opaque', 'zalloc', 'zfree', 'reserved', 'length',
 }
+_STATE_MACHINE_FIELDS = {
+    'mode', 'wrap', 'flags', 'check', 'state', 'status', 'phase', 'stage', 'step',
+}
+DIRECT_STATE_FIELDS = _IO_BOOKKEEPING_FIELDS | _STATE_MACHINE_FIELDS
 SETUP_NAME_TOKENS = {'init', 'open', 'create', 'setup', 'begin', 'start'}
 REGISTRATION_NAME_TOKENS = {'get', 'set', 'register', 'attach', 'assign', 'config', 'load'}
 
@@ -144,13 +147,13 @@ def _is_contract_relevant_predicate(condition: Dict[str, Any]) -> bool:
     operator = condition.get('operator', '')
     value = condition.get('value', '')
 
-    if owner in GENERIC_STATE_OWNERS and tail in DIRECT_STATE_FIELDS:
+    if owner in GENERIC_STATE_OWNERS and tail in _IO_BOOKKEEPING_FIELDS:
         return False
     if owner in GENERIC_STATE_OWNERS and tail in SIZE_FIELD_TOKENS:
         return False
     if owner in GENERIC_STATE_OWNERS and operator in {'<', '>', '<=', '>='}:
         return False
-    if owner in GENERIC_STATE_OWNERS and operator in {'==', '!='} and not _is_null_like(value):
+    if owner in GENERIC_STATE_OWNERS and operator in {'==', '!='} and not _is_null_like(value) and tail not in _STATE_MACHINE_FIELDS:
         return False
     return True
 
@@ -173,6 +176,8 @@ def _score_predicate(condition: Dict[str, Any]) -> int:
         score += 3
     if any(token in tail for token in SIZE_FIELD_TOKENS):
         score += 2
+    if tail in _STATE_MACHINE_FIELDS:
+        score += 3
     if target.count('->') + target.count('.') >= 2:
         score += 2
 

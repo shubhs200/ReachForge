@@ -268,8 +268,17 @@ def _direct_raw_buffer_call(code, entry_function):
 
 def _mentions_any(code, names):
     for name in names:
-        if name and _count_calls(code, name):
+        if not name:
+            continue
+        if _count_calls(code, name):
             return True
+        # Accept macro/alias variants sharing the same stem (e.g. inflateInit_
+        # satisfied by inflateInit2 or inflateInit2_)
+        stem = re.sub(r'[\d_]+$', '', name)
+        if len(stem) >= 4:
+            pattern = re.compile(r'\b' + re.escape(stem) + r'[A-Za-z0-9_]*\s*\(')
+            if pattern.search(code):
+                return True
     return False
 
 
@@ -820,8 +829,33 @@ def validate_harness_source(plan_path, source_path):
 
     violations = []
     warnings = []
+    violation_details = []   # structured: [{'id': ..., 'msg': ..., 'penalty': ..., 'critical': bool}]
+    warning_details = []     # structured: [{'id': ..., 'msg': ..., 'penalty': ...}]
     critical = False
     score = 100
+
+    def _add_violation(vid, msg, penalty, is_critical=False):
+        nonlocal score, critical
+        violations.append(msg)
+        violation_details.append({'id': vid, 'msg': msg, 'penalty': penalty, 'critical': is_critical})
+        score -= penalty
+        if is_critical:
+            critical = True
+
+    def _add_warning(wid, msg, penalty):
+        # CWE-class gating: arithmetic-overflow / recursion / OOM CVEs need
+        # exactly the patterns these warnings flag (unbounded loops, large
+        # allocations). Skip warnings whose IDs push the LLM to add the very
+        # caps that defeat the trigger. Library-agnostic.
+        _SKIP_CWE = {"CWE-190", "CWE-191", "CWE-674", "CWE-770", "CWE-789"}
+        _SKIP_WIDS = {"CONSTANT_SUPPORT_TABLE", "ENTROPY_TOO_BROAD",
+                      "WEAK_INVARIANT_EVIDENCE"}
+        if cwe_id in _SKIP_CWE and wid in _SKIP_WIDS:
+            return
+        nonlocal score
+        warnings.append(msg)
+        warning_details.append({"id": wid, "msg": msg, "penalty": penalty})
+        score -= penalty
 
     # Parser/decoder entry functions (parse, read, decode, load, etc.) are
     # designed to accept raw buffer + size -- don't penalise that pattern.
@@ -837,42 +871,73 @@ def validate_harness_source(plan_path, source_path):
     leak_vuln = cwe_id in _LEAK_CWES
 
     if entry_function and _count_calls(code, entry_function) == 0:
-        violations.append('Harness never calls the selected public entry function {}.'.format(entry_function))
-        score -= 40
-        critical = True
+        _add_violation('MISSING_ENTRY_CALL',
+                      'Harness never calls the selected public entry function {}.'.format(entry_function),
+                      40, is_critical=True)
 
     needs_state_setup = bool(setup_candidates) and (
         any(role.get('role') == 'state' for role in parameter_roles) or bool(state_fields)
     )
     if needs_state_setup and not _mentions_any(code, setup_candidates):
-        violations.append('Execution plan requires setup/state initialization, but no setup candidate appears in the harness: {}.'.format(', '.join(setup_candidates[:5])))
-        score -= 25
+        _add_violation('MISSING_STATE_SETUP',
+                      'Execution plan requires setup/state initialization, but no setup candidate appears in the harness: {}.'.format(', '.join(setup_candidates[:5])),
+                      25)
 
-    missing_setup_calls = [item.get('name') for item in required_setup_calls[:4] if item.get('name') and _count_calls(code, item.get('name')) == 0]
+    def _setup_call_present(code, name):
+        """Return True if `name` or any macro/alias variant of it is called.
+
+        zlib-style C macros expand e.g. inflateInit2(s, bits) to
+        inflateInit2_(s, bits, ZLIB_VERSION, sizeof(z_stream)).  The
+        required_setup_calls list may contain either the macro name
+        (inflateInit2) or the underlying C symbol (inflateInit_).  We accept
+        a match if:
+          - the exact name is present, OR
+          - any name sharing the same stem up to the trailing '_' is present
+            (e.g. "inflateInit_" matches "inflateInit2" and "inflateInit2_"),
+          - OR a name that is a prefix of `name` followed by optional digits
+            and optional '_'.
+        """
+        if _count_calls(code, name) > 0:
+            return True
+        # Build stem: strip trailing '_' and digits for fuzzy family match
+        stem = re.sub(r'[\d_]+$', '', name)
+        if len(stem) >= 4:
+            pattern = re.compile(r'\b' + re.escape(stem) + r'[A-Za-z0-9_]*\s*\(')
+            if pattern.search(code):
+                return True
+        return False
+
+    missing_setup_calls = [item.get('name') for item in required_setup_calls[:4] if item.get('name') and not _setup_call_present(code, item.get('name'))]
     if missing_setup_calls:
         if parser_entry or leak_vuln:
-            warnings.append('Harness may be missing setup or registration calls inferred from sink-gating state ({} - may not be needed): {}.'.format(
-                'leak vulnerability' if leak_vuln else 'parser entry', ', '.join(missing_setup_calls)))
-            score -= 8
+            _add_warning('MISSING_SETUP_CALLS_SOFT',
+                        'Harness may be missing setup or registration calls inferred from sink-gating state ({} - may not be needed): {}.'.format(
+                            'leak vulnerability' if leak_vuln else 'parser entry', ', '.join(missing_setup_calls)),
+                        8)
         else:
-            violations.append('Harness is missing required setup or registration calls inferred from sink-gating state: {}.'.format(', '.join(missing_setup_calls)))
-            score -= 20
+            _add_violation('MISSING_SETUP_CALLS',
+                          'Harness is missing required setup or registration calls inferred from sink-gating state: {}.'.format(', '.join(missing_setup_calls)),
+                          20)
 
     if 'repeated-records' in workload_model.get('operators', []) and not _has_loop(code) and not parser_entry:
-        violations.append('Workload model expects repeated logical records, but the harness does not appear to build them in a loop.')
-        score -= 20
+        _add_violation('MISSING_REPEATED_RECORDS_LOOP',
+                      'Workload model expects repeated logical records, but the harness does not appear to build them in a loop.',
+                      20)
 
     if 'chunked-stream' in workload_model.get('operators', []) and not _has_loop(code) and not parser_entry:
-        violations.append('Workload model expects incremental or chunked processing, but the harness does not implement a repeated update-style flow.')
-        score -= 20
+        _add_violation('MISSING_CHUNKED_STREAM_LOOP',
+                      'Workload model expects incremental or chunked processing, but the harness does not implement a repeated update-style flow.',
+                      20)
 
     if not parser_entry and input_model.get('primary') == 'structured-format' and entry_function and _direct_raw_buffer_call(code, entry_function):
-        violations.append('Execution plan expects structured input shaping, but the harness appears to pass raw data/size directly into the target API.')
-        score -= 20
+        _add_violation('RAW_BUFFER_STRUCTURED_INPUT',
+                      'Execution plan expects structured input shaping, but the harness appears to pass raw data/size directly into the target API.',
+                      20)
 
     if not parser_entry and construction_plan.get('requires_container_synthesis') and _direct_raw_buffer_call(code, entry_function) and not _looks_like_synthesized_container(code, entry_function):
-        violations.append('Construction plan requires synthesizing a minimally valid structured container, but the harness appears to forward raw input bytes after a control prefix instead of building a fresh container.')
-        score -= 25
+        _add_violation('MISSING_CONTAINER_SYNTHESIS',
+                      'Construction plan requires synthesizing a minimally valid structured container, but the harness appears to forward raw input bytes after a control prefix instead of building a fresh container.',
+                      25)
 
     path_requires_staged_input = (
         construction_plan.get('requires_container_synthesis') or
@@ -881,24 +946,29 @@ def validate_harness_source(plan_path, source_path):
         'chunked-stream' in workload_model.get('operators', [])
     )
     if not parser_entry and path_requires_staged_input and _looks_like_direct_progressive_passthrough(code, entry_function) and not _has_structured_container_shaping(code, entry_function):
-        violations.append('The selected wrapper path is parser or progressive-read oriented, but the harness appears to feed raw fuzz bytes directly into the public API without constructing a minimally valid structured input first.')
-        score -= 25
+        _add_violation('RAW_PASSTHROUGH_STAGED_INPUT',
+                      'The selected wrapper path is parser or progressive-read oriented, but the harness appears to feed raw fuzz bytes directly into the public API without constructing a minimally valid structured input first.',
+                      25)
 
     if sensitive_controls and not _has_selector_logic(code):
-        warnings.append('Sensitive controls were inferred, but the harness has no obvious selector logic to bias them deliberately.')
-        score -= 8
+        _add_warning('MISSING_SELECTOR_LOGIC',
+                    'Sensitive controls were inferred, but the harness has no obvious selector logic to bias them deliberately.',
+                    8)
 
     if any(item.get('policy') == 'stabilize' for item in exploration_policy) and code.count('data[') > 8:
-        warnings.append('The harness may be spending entropy on too many direct byte-to-parameter mappings instead of stabilizing low-signal knobs.')
-        score -= 5
+        _add_warning('ENTROPY_OVER_SPREAD',
+                    'The harness may be spending entropy on too many direct byte-to-parameter mappings instead of stabilizing low-signal knobs.',
+                    5)
 
     if not parser_entry and input_model.get('primary') == 'semantic-arguments' and _direct_raw_buffer_call(code, entry_function):
-        violations.append('Execution plan models this sink as semantic arguments or support objects, but the harness still appears to forward raw fuzzer bytes directly into the target API.')
-        score -= 20
+        _add_violation('RAW_BUFFER_SEMANTIC_ARGS',
+                      'Execution plan models this sink as semantic arguments or support objects, but the harness still appears to forward raw fuzzer bytes directly into the target API.',
+                      20)
 
     if trigger_controls and not _has_selector_logic(code):
-        warnings.append('Trigger controls were inferred, but the harness does not show deliberate bounded control selection for them: {}.'.format(', '.join(trigger_controls[:4])))
-        score -= 8
+        _add_warning('MISSING_TRIGGER_CONTROL_SELECTOR',
+                    'Trigger controls were inferred, but the harness does not show deliberate bounded control selection for them: {}.'.format(', '.join(trigger_controls[:4])),
+                    8)
 
     for relation in trigger_relations[:6]:
         relation_ok, relation_reason = _relation_diagnostics(code, relation, entry_function, parameter_roles)
@@ -918,65 +988,72 @@ def validate_harness_source(plan_path, source_path):
             if relation_reason:
                 message += ' Diagnostic: {}.'.format(relation_reason)
             if relation.get('priority') == 'high' and not leak_vuln:
-                violations.append(message)
-                score -= 18
+                _add_violation('TRIGGER_RELATION_MISS', message, 18)
             else:
-                warnings.append(message)
-                score -= 6
+                _add_warning('TRIGGER_RELATION_MISS_SOFT', message, 6)
 
     if setup_state_profiles and _has_broad_setup_mode_switch(code, entry_function):
-        warnings.append('Harness varies broad setup-mode families before the sink; prefer the smallest liveness-preserving setup controls that still change the legal range of later arguments.')
-        score -= 8
+        _add_warning('BROAD_SETUP_MODE_SWITCH',
+                    'Harness varies broad setup-mode families before the sink; prefer the smallest liveness-preserving setup controls that still change the legal range of later arguments.',
+                    8)
 
     for requirement in setup_requirements[:3]:
         if not _has_setup_requirement_evidence(code, requirement):
-            warnings.append('Harness may be missing a setup requirement that should stay valid while trigger controls are varied: {}.'.format(requirement))
-            score -= 2 if leak_vuln else 4
+            _add_warning('MISSING_SETUP_REQUIREMENT',
+                        'Harness may be missing a setup requirement that should stay valid while trigger controls are varied: {}.'.format(requirement),
+                        2 if leak_vuln else 4)
 
     if 'setjmp(' in code and 'abort()' in code:
-        violations.append('Harness uses setjmp-style error recovery but still aborts in an error callback, which can cause false positive crashes.')
-        score -= 20
-        critical = True
+        _add_violation('SETJMP_ABORT_CONFLICT',
+                      'Harness uses setjmp-style error recovery but still aborts in an error callback, which can cause false positive crashes.',
+                      20, is_critical=True)
 
     null_helper_issues = _find_suspicious_null_helper_calls(code, construction_plan)
     for issue in null_helper_issues:
-        violations.append(issue)
-        score -= 20
+        _add_violation('NULL_HELPER_CALL', issue, 20)
 
     if construction_plan.get('support_object_construction') and not _has_support_object_construction_evidence(code, construction_plan.get('support_object_construction', [])):
         if parser_entry or leak_vuln:
-            warnings.append('Harness shows weak evidence of constructing the required support object fields before the sink path is exercised ({} - may not be needed).'.format(
-                'leak vulnerability' if leak_vuln else 'parser entry'))
-            score -= 6
+            _add_warning('WEAK_SUPPORT_OBJECT_SOFT',
+                        'Harness shows weak evidence of constructing the required support object fields before the sink path is exercised ({} - may not be needed).'.format(
+                            'leak vulnerability' if leak_vuln else 'parser entry'),
+                        6)
         else:
-            violations.append('Harness shows weak evidence of constructing the required support object fields before the sink path is exercised.')
-            score -= 18
+            _add_violation('WEAK_SUPPORT_OBJECT',
+                          'Harness shows weak evidence of constructing the required support object fields before the sink path is exercised.',
+                          18)
 
     null_callback_setups = _find_null_callback_setup_calls(code)
     if null_callback_setups and any(role.get('role') == 'state' for role in parameter_roles) and failure_path_indicators.get('error_calls') and 'setjmp(' not in code:
         if parser_entry:
-            warnings.append('Harness creates state through setup-style calls with NULL/nullptr placeholders and no local error recovery (parser entry - NULL args may be valid defaults): {}.'.format(', '.join(null_callback_setups)))
-            score -= 8
+            _add_warning('NULL_CALLBACK_SETUP_SOFT',
+                        'Harness creates state through setup-style calls with NULL/nullptr placeholders and no local error recovery (parser entry - NULL args may be valid defaults): {}.'.format(', '.join(null_callback_setups)),
+                        8)
         else:
-            violations.append('Harness appears to create state through setup-style calls with repeated NULL/nullptr callback placeholders and no local error recovery: {}. Install non-fatal callback handling or equivalent error containment in the harness.'.format(', '.join(null_callback_setups)))
-            score -= 25
+            _add_violation('NULL_CALLBACK_SETUP',
+                          'Harness appears to create state through setup-style calls with repeated NULL/nullptr callback placeholders and no local error recovery: {}. Install non-fatal callback handling or equivalent error containment in the harness.'.format(', '.join(null_callback_setups)),
+                          25)
 
     milestone_kinds = set([item.get('kind') for item in milestone_plan if item.get('required')])
     if 'object-lifecycle' in milestone_kinds and not (_mentions_any(code, setup_candidates) or _has_generic_state_setup(code)):
-        violations.append('Milestone plan requires valid state creation before sink-oriented fuzzing, but the harness shows no plausible setup or object-lifecycle construction.')
-        score -= 20
+        _add_violation('MISSING_OBJECT_LIFECYCLE',
+                      'Milestone plan requires valid state creation before sink-oriented fuzzing, but the harness shows no plausible setup or object-lifecycle construction.',
+                      20)
 
     if not parser_entry and 'container-parse' in milestone_kinds and input_model.get('primary') == 'structured-format' and not _has_structured_container_shaping(code, entry_function):
-        violations.append('Milestone plan requires the library to accept a minimally valid structured container before the sink can be live, but the harness shows no plausible container shaping.')
-        score -= 20
+        _add_violation('MISSING_CONTAINER_SHAPING',
+                      'Milestone plan requires the library to accept a minimally valid structured container before the sink can be live, but the harness shows no plausible container shaping.',
+                      20)
 
     if 'incremental-feed' in milestone_kinds and not _has_loop(code) and not parser_entry:
-        violations.append('Milestone plan requires repeated feed or update progress before the sink is likely to execute, but the harness has no obvious bounded incremental flow.')
-        score -= 18
+        _add_violation('MISSING_INCREMENTAL_FEED',
+                      'Milestone plan requires repeated feed or update progress before the sink is likely to execute, but the harness has no obvious bounded incremental flow.',
+                      18)
 
     if 'transform-gating' in milestone_kinds and not _has_transform_configuration(code, support_keywords):
-        warnings.append('Milestone plan suggests sink-adjacent transform or configuration state is required, but the harness shows no obvious transform-configuration step.')
-        score -= 6
+        _add_warning('MISSING_TRANSFORM_CONFIG',
+                    'Milestone plan suggests sink-adjacent transform or configuration state is required, but the harness shows no obvious transform-configuration step.',
+                    6)
 
     deferred_transform = 'transform' in deferred_stages and stage_contracts.get('transform', {})
     if deferred_transform:
@@ -996,49 +1073,57 @@ def validate_harness_source(plan_path, source_path):
             'milestone_hints',
         ])
         if has_transform_obligation and not _has_transform_configuration(code, support_keywords):
-            warnings.append('Deferred transform-stage obligations were inferred, but the harness shows no obvious later-stage transform or configuration step after parser or setup milestones.')
-            score -= 6
+            _add_warning('MISSING_DEFERRED_TRANSFORM',
+                        'Deferred transform-stage obligations were inferred, but the harness shows no obvious later-stage transform or configuration step after parser or setup milestones.',
+                        6)
         empty_callbacks = _find_empty_transform_callbacks(code, callback_names, transform_api_names)
         if empty_callbacks:
-            violations.append('Deferred transform-stage callbacks are registered but do not execute the required transform work: {}. Place the deferred transform APIs inside the callback or stage-transition body that owns this stage.'.format(', '.join(empty_callbacks)))
-            score -= 20
-            critical = True
+            _add_violation('EMPTY_TRANSFORM_CALLBACK',
+                          'Deferred transform-stage callbacks are registered but do not execute the required transform work: {}. Place the deferred transform APIs inside the callback or stage-transition body that owns this stage.'.format(', '.join(empty_callbacks)),
+                          20, is_critical=True)
         early_transform_calls = _find_early_transform_calls(code, entry_function, transform_api_names, callback_names)
         if early_transform_calls:
-            violations.append('Deferred transform-stage APIs appear before the first public entry invocation instead of executing at a later callback or post-parse transition site: {}.'.format(', '.join(early_transform_calls)))
-            score -= 20
-            critical = True
+            _add_violation('EARLY_TRANSFORM_CALL',
+                          'Deferred transform-stage APIs appear before the first public entry invocation instead of executing at a later callback or post-parse transition site: {}.'.format(', '.join(early_transform_calls)),
+                          20, is_critical=True)
         dead_support_state = _find_dead_support_state_names(code, support_keywords)
         if dead_support_state:
-            warnings.append('Harness populates support-like staged state that is never consumed by any helper or transform call: {}.'.format(', '.join(dead_support_state)))
-            score -= 6
+            _add_warning('DEAD_SUPPORT_STATE',
+                        'Harness populates support-like staged state that is never consumed by any helper or transform call: {}.'.format(', '.join(dead_support_state)),
+                        6)
 
     if 'work-unit' in milestone_kinds and not (_has_loop(code) or _has_structured_container_shaping(code, entry_function)):
-        warnings.append('Milestone plan suggests the sink depends on produced rows, blocks, records, or similar work units, but the harness has weak evidence of driving the API that far.')
-        score -= 6
+        _add_warning('WEAK_WORK_UNIT_EVIDENCE',
+                    'Milestone plan suggests the sink depends on produced rows, blocks, records, or similar work units, but the harness has weak evidence of driving the API that far.',
+                    6)
 
     mutable_regions = active_data_plan.get('mutable_regions', [])
     high_priority_names = [item.get('name') for item in mutable_regions if item.get('priority') == 'high']
     if high_priority_names and _looks_like_trailing_append_only(code) and not _has_data_driven_support_object(code, support_keywords):
-        violations.append('Active data plan expects sink-relevant mutation placement, but the harness appears to spend entropy on trailing appended bytes without driving high-value mutable regions such as {}.'.format(', '.join(high_priority_names[:4])))
-        score -= 20
+        _add_violation('TRAILING_APPEND_HIGH_VALUE',
+                      'Active data plan expects sink-relevant mutation placement, but the harness appears to spend entropy on trailing appended bytes without driving high-value mutable regions such as {}.'.format(', '.join(high_priority_names[:4])),
+                      20)
 
     if any(item.get('name') == 'decoded-work-unit' for item in mutable_regions) and _looks_like_trailing_append_only(code):
-        violations.append('Active data plan says decoded work units should carry fuzz entropy, but the harness appears to append raw bytes after a finished body instead of mutating post-parse work-unit contents.')
-        score -= 18
+        _add_violation('TRAILING_APPEND_WORK_UNIT',
+                      'Active data plan says decoded work units should carry fuzz entropy, but the harness appears to append raw bytes after a finished body instead of mutating post-parse work-unit contents.',
+                      18)
 
     if any(item.get('kind') in ['table', 'config'] for item in mutable_regions) and not _has_data_driven_support_object(code, support_keywords):
-        warnings.append('Active data plan suggests support tables or configuration should be fuzz-driven within valid bounds, but the harness appears to keep them constant.')
-        score -= 6
+        _add_warning('CONSTANT_SUPPORT_TABLE',
+                    'Active data plan suggests support tables or configuration should be fuzz-driven within valid bounds, but the harness appears to keep them constant.',
+                    6)
 
     if active_data_plan.get('stabilized_regions') and _counts_data_usages(code) > 14 and input_model.get('primary') == 'structured-format':
-        warnings.append('The harness may still be injecting fuzz entropy too broadly into structured input instead of stabilizing the container skeleton and concentrating on sink-relevant regions.')
-        score -= 5
+        _add_warning('ENTROPY_TOO_BROAD',
+                    'The harness may still be injecting fuzz entropy too broadly into structured input instead of stabilizing the container skeleton and concentrating on sink-relevant regions.',
+                    5)
 
     for requirement in invariant_requirements[:3]:
         if not _has_setup_requirement_evidence(code, requirement):
-            warnings.append('Harness shows weak evidence that it preserves an inferred trigger invariant: {}.'.format(requirement))
-            score -= 4
+            _add_warning('WEAK_INVARIANT_EVIDENCE',
+                        'Harness shows weak evidence that it preserves an inferred trigger invariant: {}.'.format(requirement),
+                        4)
 
     # A harness passes if no critical violation was found AND the score
     # stays above the acceptance threshold.  This avoids false rejections
@@ -1052,6 +1137,8 @@ def validate_harness_source(plan_path, source_path):
         'score': max(0, score),
         'violations': violations,
         'warnings': warnings,
+        'violation_details': violation_details,
+        'warning_details': warning_details,
         'relation_diagnostics': relation_diagnostics,
     }
 
@@ -1069,7 +1156,7 @@ def run_runtime_smoke(harness_binary, out_dir, plan_path=None):
 
     env = os.environ.copy()
     env['ASAN_OPTIONS'] = 'abort_on_error=1:detect_leaks=0'
-    env['UBSAN_OPTIONS'] = 'abort_on_error=1'
+    env['UBSAN_OPTIONS'] = 'abort_on_error=1:print_stacktrace=1:silence_unsigned_overflow=1'
 
     try:
         result = subprocess.run(

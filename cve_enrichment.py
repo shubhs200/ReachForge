@@ -458,7 +458,51 @@ def _merge_enrichment(entry, enrichment):
                 enriched["affected-file"] = fname
                 print("[enrichment] Auto-derived affected-file from description: {}".format(fname))
 
-    # Auto-derive affected-function from all available sources (cascading)
+    # Auto-derive affected-function from all available sources (cascading).
+    # We filter ``patch_diffs`` BEFORE derivation so hunk-header extraction
+    # sees only the highest-scored sub-patches and isn't fooled by
+    # noise commits (release tarballs, doc updates, copyright bumps).
+    if enrichment.get("patch_diffs"):
+        desc = enriched.get("description", "")
+        afunc = enriched.get("affected-function", "")
+        # Reuse the same keyword set the per-element filter would use.
+        rank_keywords = ['security', 'vuln', 'CVE-', 'use-after-free',
+                         'buffer overflow', 'heap overflow',
+                         'heap-use-after-free', 'out-of-bounds',
+                         'denial of service', 'double-free',
+                         'null dereference', 'integer overflow']
+        if afunc:
+            rank_keywords.append(afunc)
+        if desc:
+            m = re.search(r'\bin\s+(?:the\s+)?(\w+)\s+function\b', desc)
+            if m:
+                rank_keywords.append(m.group(1))
+            m = re.search(r'\bin\s+(\w+\.(?:c|h|cc|cpp))\b', desc)
+            if m:
+                rank_keywords.append(m.group(1))
+        afile = enriched.get("affected-file", "")
+
+        scored_diffs = []
+        for pd in enrichment["patch_diffs"]:
+            try:
+                filt = _filter_security_patches(pd, description=desc,
+                                                affected_function=afunc)
+            except Exception:
+                filt = pd
+            if not filt or not filt.strip():
+                continue
+            try:
+                sc = _score_sub_patch(filt, rank_keywords, afile)
+            except Exception:
+                sc = 0.0
+            scored_diffs.append((sc, filt))
+        # Sort descending by score so patch_diffs[0] is the highest-ranked
+        # commit (the real security fix), not a release-tidy noise commit.
+        scored_diffs.sort(key=lambda x: x[0], reverse=True)
+        cleaned = [s for _, s in scored_diffs]
+        enrichment["patch_diffs"] = cleaned
+        enriched["patch_diffs"] = cleaned
+
     if not enriched.get("affected-function"):
         func = _derive_affected_function(enriched, enrichment)
         if func:
@@ -469,22 +513,6 @@ def _merge_enrichment(entry, enrichment):
         enriched["cvss_score"] = enrichment["cvss_score"]
     if enrichment.get("cvss_vector"):
         enriched["cvss_vector"] = enrichment["cvss_vector"]
-
-    # Patch diffs (the most valuable piece for the LLM)
-    # Filter multi-commit patches to security-relevant sub-patches before
-    # storing — this removes copyright bumps, CI changes, version bumps, etc.
-    if enrichment.get("patch_diffs"):
-        desc = enriched.get("description", "")
-        afunc = enriched.get("affected-function", "")
-        filtered_diffs = []
-        for pd in enrichment["patch_diffs"]:
-            try:
-                filt = _filter_security_patches(pd, description=desc,
-                                                affected_function=afunc)
-                filtered_diffs.append(filt)
-            except Exception:
-                filtered_diffs.append(pd)
-        enriched["patch_diffs"] = [d for d in filtered_diffs if d.strip()]
 
     # Extract and store trigger condition analysis from the filtered patch diff
     if enriched.get("patch_diffs") and not enriched.get("trigger_condition"):
@@ -560,6 +588,29 @@ _FUNCTION_NAME_BLOCKLIST = frozenset([
     'app', 'web', 'build', 'infra', 'tools', 'internal', 'include',
     # Adverbs / English words that pass plausibility but are not functions
     'internally', 'externally', 'previously', 'optionally',
+    # Standard library / POSIX functions mentioned as symptoms in CVE
+    # descriptions — never the real target for fuzzing
+    'memmove', 'memcpy', 'memset', 'memcmp', 'memchr',
+    'strlen', 'strcmp', 'strncmp', 'strcpy', 'strncpy',
+    'strcat', 'strncat', 'strstr', 'strchr', 'strrchr', 'strtol', 'strtoul',
+    'malloc', 'calloc', 'realloc', 'free',
+    'printf', 'fprintf', 'sprintf', 'snprintf', 'sscanf', 'scanf', 'vsnprintf',
+    'read', 'write', 'open', 'close', 'fopen', 'fclose', 'fread', 'fwrite',
+    'abort', 'exit', 'assert',
+    # C/C++ language keywords — never function names; show up in hunk
+    # headers when the diff context is inside a control-flow block at top
+    # scope (e.g. ``@@ ... @@ while (*cc != XCL_END)``).
+    'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'default',
+    'return', 'break', 'continue', 'goto', 'sizeof', 'static',
+    'const', 'extern', 'inline', 'register', 'volatile', 'auto',
+    'struct', 'union', 'enum', 'typedef', 'class', 'public',
+    'private', 'protected', 'namespace', 'template', 'typename',
+    'using', 'virtual', 'override', 'final', 'try', 'catch', 'throw',
+    'new', 'delete', 'operator', 'friend', 'explicit', 'mutable',
+    'void', 'int', 'char', 'short', 'long', 'float', 'double',
+    'signed', 'unsigned', 'bool', 'true', 'false',
+    # Preprocessor leftovers
+    'endif', 'ifdef', 'ifndef', 'define', 'undef', 'pragma', 'include',
 ])
 
 
@@ -599,6 +650,8 @@ _FUNC_EXTRACT_PATTERNS = [
     (re.compile(r'\bthe\s+([a-zA-Z_]\w+)\s*(?:\(\))?\s+function\b', re.IGNORECASE), 1, 9),
     # "via FUNC in file.c" / "via FUNC() at /path/file.c"
     (re.compile(r'\bvia\s+(?:the\s+)?([a-zA-Z_]\w+)(?:\(\))?\s+(?:in|at)\s+[\w/.]+\.\w+', re.IGNORECASE), 1, 9),
+    # "demonstrated by FUNC" / "evidenced by FUNC" / "shown by FUNC"
+    (re.compile(r'\b(?:demonstrated|evidenced|illustrated|shown|triggered)\s+by\s+([a-zA-Z_]\w+)', re.IGNORECASE), 1, 9),
     # back-ticked: `FUNC` or `FUNC()`
     (re.compile(r'`([a-zA-Z_]\w+?)(?:\(\))?`'), 1, 12),
     # FUNC() call syntax in prose
@@ -786,6 +839,23 @@ _VERSION_BUMP_RE = re.compile(
 
 _HUNK_HEADER_RE = re.compile(r'^@@\s')
 
+# Lines that look like cosmetic / metadata noise rather than real code
+# changes.  Used by ``extract_trigger_condition`` to keep
+# ``vulnerable_lines`` / ``fix_lines`` focused on actual program behaviour.
+_PURE_NOISE_RE = re.compile(
+    r'(?i)('
+    r'copyright\b'
+    r'|all rights reserved'
+    r'|last updated\s*:'
+    r'|^\s*version\s+\d+\.\d+'
+    r'|^\s*release\s+\d+\.\d+'
+    r'|^\s*<[a-z!/][^>]*>\s*$'              # standalone HTML/SGML tag
+    r'|^\s*[-=*#]{3,}\s*$'                   # horizontal rules
+    r'|^\s*\*\s*$'                           # bare comment marker
+    r'|^\s*//\s*$'
+    r')',
+)
+
 
 def _is_version_bump_only(patch_text):
     """Return True if every changed hunk line in source files is a version/copyright bump.
@@ -823,15 +893,136 @@ def _is_version_bump_only(patch_text):
     return has_source_changes  # True only if we saw changes and ALL were version bumps
 
 
+# Sub-patch scoring signals (generic; no library/CVE knowledge).
+_FIX_SUBJECT_TOKENS = (
+    'fix', 'vuln', 'overflow', 'out-of-bound', 'out of bound',
+    'use-after-free', 'use after free', 'double-free', 'double free',
+    'null', 'leak', 'crash', 'segfault', 'cve-', 'security',
+    'deref', 'shift', 'negative', 'race', 'infinite', 'recursion',
+    'exhaust', 'sanitize', 'oob', 'uaf',
+)
+_NOISE_SUBJECT_TOKENS = (
+    'tidy', 'release', 'version bump', 'changelog', 'readme',
+    'documentation', 'doc:', 'whitespace', 'spelling', 'typo',
+    'comment:', 'lint', 'format', 'reformat', 'cosmetic',
+    'rename ', 'move ', 'merge branch', 'merge pull request',
+)
+_DOC_PATH_HINTS = (
+    '.md', '.rst', '.txt', '/doc/', '/docs/', '/news', '/changelog',
+    '/readme', '.html', '.pdf', '.bib', '.po', '/man/', '.1', '.3',
+)
+_META_PATH_HINTS = (
+    'cmakelists', 'configure.ac', 'configure.in', 'makefile', '.am',
+    'license', 'authors', '.cmake', '.pc.in', '.spec',
+)
+_SUBJECT_RE = re.compile(
+    r'^Subject:\s*(?:\[PATCH(?:\s+\d+/\d+)?\]\s*)?(.*)$',
+    flags=re.MULTILINE,
+)
+_CVE_ID_RE = re.compile(r'\bcve-\d{4}-\d{4,7}\b', re.IGNORECASE)
+
+
+def _score_sub_patch(sub_patch, keywords, affected_file=""):
+    """Heuristic relevance score for a sub-patch (higher = more likely the
+    real security fix).  All signals are generic — no per-library logic.
+
+    Combines: commit-subject tokens, file-set composition, affected-file
+    hit, and density of *substantive* (non-whitespace, non-version-bump)
+    +/- changes.
+    """
+    if not sub_patch:
+        return -100.0
+    score = 0.0
+
+    msubj = _SUBJECT_RE.search(sub_patch)
+    subject = (msubj.group(1) if msubj else "").strip().lower()
+    if subject:
+        if any(tok in subject for tok in _FIX_SUBJECT_TOKENS):
+            score += 4.0
+        if any(tok in subject for tok in _NOISE_SUBJECT_TOKENS):
+            score -= 5.0
+        if _CVE_ID_RE.search(subject):
+            score += 5.0
+
+    # Body / hunk keyword match (re-uses existing _sub_patch_mentions which
+    # excludes diffstat and file-header lines).
+    if keywords and _sub_patch_mentions(sub_patch, keywords):
+        score += 2.0
+
+    # File-set composition.
+    file_paths = []
+    for line in sub_patch.split('\n'):
+        if line.startswith('diff --git '):
+            m = re.search(r'diff --git a/(\S+)', line)
+            if m:
+                file_paths.append(m.group(1))
+    n_files = len(file_paths)
+    n_source = sum(
+        1 for p in file_paths
+        if os.path.splitext(p)[1].lower() in _SOURCE_EXTS
+    )
+    pl = [p.lower() for p in file_paths]
+    n_doc = sum(
+        1 for p in pl if any(h in p or p.endswith(h) for h in _DOC_PATH_HINTS)
+    )
+    n_meta = sum(
+        1 for p in pl if any(h in p for h in _META_PATH_HINTS)
+    )
+
+    if n_files >= 8:
+        score -= 2.0
+    if n_files >= 20:
+        score -= 4.0  # release-tidy-style sprawl
+    if 1 <= n_source <= 3 and n_doc <= 1 and n_meta <= 1:
+        score += 3.0
+    if n_files > 0 and (n_doc + n_meta) > n_source:
+        score -= 3.0
+
+    if affected_file:
+        af = affected_file.lower()
+        # Match on basename or path substring
+        if any(af in p for p in pl):
+            score += 4.0
+
+    # Substantive change density: count +/- lines after stripping
+    # whitespace, comment, copyright/version-bump lines.
+    real_changes = 0
+    for line in sub_patch.split('\n'):
+        if not line or line[0] not in '+-':
+            continue
+        if line.startswith('+++') or line.startswith('---'):
+            continue
+        body = line[1:]
+        s = body.strip()
+        if not s:
+            continue
+        if _VERSION_BUMP_RE.search(body):
+            continue
+        if s.startswith('//') or s.startswith('*') or s.startswith('/*') \
+                or s.startswith('#') or s.startswith('--'):
+            continue
+        real_changes += 1
+
+    if 1 <= real_changes <= 50:
+        score += 3.0
+    elif real_changes > 200:
+        score -= 3.0
+    elif real_changes == 0:
+        score -= 6.0  # whitespace / copyright only
+
+    return score
+
+
 def _filter_security_patches(patch_text, description="", affected_function=""):
-    """Filter a multi-commit patch diff to only security-relevant sub-patches.
+    """Filter a multi-commit patch diff to only the security-relevant sub-patch(es).
 
     Strategy:
     1. Split into individual sub-patches (one per 'From <hash>' block).
-    2. Keep sub-patches that touch C/C++ source files.
-    3. Among those, prefer sub-patches whose subject/body mention the affected
-       function, CVE ID, 'security', 'fix', 'vuln', or the affected function.
-    4. If nothing survives, fall back to the original text.
+    2. Drop sub-patches that don't touch C/C++ source.
+    3. Score each survivor with ``_score_sub_patch`` and rank descending.
+    4. Keep the top-scored sub-patch; additionally keep any other survivors
+       with positive score.  If all scores are ≤ 0, keep only the top one
+       (defensive — never lose the patch entirely).
     """
     subs = _split_sub_patches(patch_text)
 
@@ -867,16 +1058,28 @@ def _filter_security_patches(patch_text, description="", affected_function=""):
     # Filter: must touch C/C++ source
     source_subs = [s for s in subs if _sub_patch_touches_source(s)]
     if not source_subs:
-        return patch_text  # fallback
+        return ""  # nothing relevant
 
-    # Among source-touching subs, prefer ones mentioning security keywords
-    relevant = [s for s in source_subs if _sub_patch_mentions(s, keywords)]
-    if relevant:
-        return '\n'.join(relevant)
+    # Score and rank — extract affected_file from description for scoring.
+    affected_file = ""
+    if description:
+        m = re.search(r'\bin\s+(\w+\.(?:c|h|cc|cpp|cxx|hh|hpp))\b', description)
+        if m:
+            affected_file = m.group(1)
 
-    # No keyword match means none of these sub-patches are the actual
-    # security fix — return empty so the caller can discard this entry.
-    return ""
+    scored = [(_score_sub_patch(s, keywords, affected_file), s)
+              for s in source_subs]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    top_score = scored[0][0]
+    # Keep top + any other clearly positive scorers.  If everything is
+    # non-positive, keep only the top to avoid losing the patch entirely.
+    kept = [scored[0][1]]
+    for sc, s in scored[1:]:
+        if sc > 0 and sc >= top_score - 2.0:
+            kept.append(s)
+
+    return '\n'.join(kept)
 
 
 def _extract_file_from_description(enriched, enrichment):
@@ -925,8 +1128,13 @@ def _extract_file_from_patch(patch_text, description=""):
             if m:
                 desc_file = m.group(1).lower()
 
-    # Collect all files from the diff
-    source_files = []
+    # Collect all files from the diff, separating implementation files
+    # (.c/.cc/.cpp/.cxx) from headers (.h/.hh/.hpp).  The actual bug almost
+    # always lives in the implementation; headers are usually touched only
+    # to update declarations / type signatures.
+    impl_exts = frozenset(('.c', '.cc', '.cpp', '.cxx'))
+    impl_files = []
+    header_files = []
     other_files = []
     for line in patch_text.split('\n'):
         if line.startswith('+++ b/'):
@@ -937,9 +1145,14 @@ def _extract_file_from_patch(patch_text, description=""):
                 # If it matches the description, return immediately
                 if desc_file and fname.lower() == desc_file:
                     return fname
-                source_files.append(fname)
+                if ext in impl_exts:
+                    impl_files.append(fname)
+                else:
+                    header_files.append(fname)
             else:
                 other_files.append(fname)
+
+    source_files = impl_files + header_files
 
     # Prefer C/C++ source file mentioned in description
     if desc_file:
@@ -947,9 +1160,11 @@ def _extract_file_from_patch(patch_text, description=""):
             if desc_file in f.lower():
                 return f
 
-    # Return first C/C++ source file
-    if source_files:
-        return source_files[0]
+    # Prefer implementation file over header
+    if impl_files:
+        return impl_files[0]
+    if header_files:
+        return header_files[0]
     # No source files found — return empty rather than a non-source file
     # (e.g. CONTRIBUTORS.md) which would poison downstream analysis.
     return ""
@@ -1004,13 +1219,19 @@ def extract_trigger_condition(patch_text, description=""):
         # Collect removed (vulnerable) lines — skip pure whitespace changes
         if line.startswith('-') and not line.startswith('---'):
             stripped = line[1:].strip()
-            if stripped and len(stripped) > 3:
+            if (stripped and len(stripped) > 3
+                    and len(stripped) <= 300
+                    and not _VERSION_BUMP_RE.search(stripped)
+                    and not _PURE_NOISE_RE.search(stripped)):
                 vulnerable_lines.append(stripped)
 
         # Collect added (fix) lines
         if line.startswith('+') and not line.startswith('+++'):
             stripped = line[1:].strip()
-            if stripped and len(stripped) > 3:
+            if (stripped and len(stripped) > 3
+                    and len(stripped) <= 300
+                    and not _VERSION_BUMP_RE.search(stripped)
+                    and not _PURE_NOISE_RE.search(stripped)):
                 fix_lines.append(stripped)
 
     # Build trigger summary by combining description + diff analysis
@@ -1229,11 +1450,16 @@ def synthesize_trigger_protocol(commit_messages, patch_diff, trigger_function_so
 
 # --------------- Multi-source function extraction ---------------
 
-def _extract_function_from_all_descriptions(enrichment, enriched):
+def _extract_function_from_all_descriptions(enrichment, enriched,
+                                             known_functions=None):
     """Try extracting the affected function from every available description source.
 
     Priority: NVD description > OSV details > OSV summary > GitHub description
     > GitHub summary.  Returns the first successful extraction or empty string.
+
+    If *known_functions* is provided, all sources are scanned and the
+    candidate that appears in the project's actual function set is preferred
+    over a textually-earlier candidate that does not.
     """
     sources = [
         enriched.get("description", ""),
@@ -1244,14 +1470,28 @@ def _extract_function_from_all_descriptions(enrichment, enriched):
         enrichment.get("gh_summary", ""),
     ]
     seen = set()
-    for text in sources:
+    all_candidates = []  # (func_name, source_priority)
+    for priority, text in enumerate(sources):
         if not text or text in seen:
             continue
         seen.add(text)
         func = _extract_function_from_description(text)
         if func:
+            all_candidates.append((func, priority))
+
+    if not all_candidates:
+        return ""
+
+    # Without cross-validation, return the highest-priority (earliest) match.
+    if not known_functions:
+        return all_candidates[0][0]
+
+    # Prefer a candidate that actually exists in the project's codebase.
+    for func, _ in all_candidates:
+        if func in known_functions:
             return func
-    return ""
+    # No candidate matched the codebase — return the best textual match.
+    return all_candidates[0][0]
 
 
 def _extract_function_from_commit_messages(patch_diffs):
@@ -1535,7 +1775,7 @@ def _extract_function_via_llm(enriched, enrichment):
         return ""
 
 
-def _derive_affected_function(enriched, enrichment):
+def _derive_affected_function(enriched, enrichment, known_functions=None):
     """Multi-source cascading extraction of the affected function name.
 
     Tries progressively more expensive sources and returns the first match:
@@ -1544,24 +1784,52 @@ def _derive_affected_function(enriched, enrichment):
     3. Patch hunk headers (with cross-reference ranking)
     4. Bug-tracker reference URLs
     5. LLM extraction (last resort)
+
+    If *known_functions* (a set of function names from the project's call
+    graph) is provided, candidates that appear in the project are boosted
+    so that textually plausible names that don't exist in the codebase are
+    less likely to win.
     """
+    desc = enriched.get("description", "")
+    affected_file = enriched.get("affected-file", "")
+    patch_diffs = enrichment.get("patch_diffs", []) or []
+
+    # 0. Patch hunk headers FIRST when patches exist AND the candidate is
+    # corroborated by the CVE description (or by the project's call graph).
+    # Hunk-header function names from the security-fix commit are ground
+    # truth for *what was changed*, but a multi-file fix may patch helper
+    # functions whose names don't match the actual crash site.  Requiring
+    # corroboration prevents us from preferring a helper over the API
+    # surface that the description points at.
+    if patch_diffs:
+        hunk_func = _extract_function_from_patch_hunks(
+            patch_diffs, desc, affected_file)
+        if hunk_func and _is_plausible_c_function(hunk_func):
+            corroborated = False
+            if known_functions and hunk_func in known_functions:
+                corroborated = True
+            elif desc and re.search(r'\b' + re.escape(hunk_func) + r'\b', desc):
+                corroborated = True
+            if corroborated:
+                print("[enrichment] Auto-derived affected-function from patch hunks: {}".format(hunk_func))
+                return hunk_func
+
     # 1. Try all description sources
-    func = _extract_function_from_all_descriptions(enrichment, enriched)
+    func = _extract_function_from_all_descriptions(enrichment, enriched,
+                                                    known_functions=known_functions)
     if func:
         print("[enrichment] Auto-derived affected-function from description: {}".format(func))
         return func
 
     # 2. Try commit message subjects
-    func = _extract_function_from_commit_messages(enrichment.get("patch_diffs", []))
+    func = _extract_function_from_commit_messages(patch_diffs)
     if func:
         print("[enrichment] Auto-derived affected-function from commit message: {}".format(func))
         return func
 
-    # 3. Try patch hunk headers (pass affected-file for cross-reference)
-    desc = enriched.get("description", "")
-    affected_file = enriched.get("affected-file", "")
-    func = _extract_function_from_patch_hunks(
-        enrichment.get("patch_diffs", []), desc, affected_file)
+    # 3. Patch hunk headers (fallback if the above didn't pass the
+    # known-functions check; runs again here without that constraint).
+    func = _extract_function_from_patch_hunks(patch_diffs, desc, affected_file)
     if func:
         print("[enrichment] Auto-derived affected-function from patch hunks: {}".format(func))
         return func

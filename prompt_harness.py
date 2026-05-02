@@ -180,6 +180,55 @@ def _build_strategy_synthesis(lines, entry, execution_plan):
         lines.append("")
 
 
+def _cwe_specific_guidance(plan: dict) -> list:
+    """Return CWE-conditional prompt lines to *prevent* the LLM from
+    adding the safety bounds that, ironically, defeat the trigger for
+    arithmetic-overflow / recursion / size-driven CVEs.
+
+    Library-agnostic; driven entirely off the CVE's CWE classification.
+    """
+    cwes = []
+    entry = plan.get("vuln_entry", {}) if isinstance(plan, dict) else {}
+    raw = entry.get("cwe-id") or entry.get("cwe") or []
+    if isinstance(raw, str):
+        cwes = [c.strip() for c in raw.replace(",", " ").split() if c.strip()]
+    elif isinstance(raw, list):
+        cwes = [str(c).strip() for c in raw if str(c).strip()]
+    cwes = {c.upper() for c in cwes}
+
+    blocks = []
+    if cwes & {"CWE-190", "CWE-191"}:
+        blocks.append(
+            "- Bug class is *arithmetic overflow* (CWE-190/191). The "
+            "overflow IS the trigger. Do NOT cap, modulo, clamp, or "
+            "saturate input-derived size/length/count values before "
+            "passing them to the sink. Wire input bytes directly to the "
+            "size argument, optionally biased near the boundary "
+            "(e.g. `int len = INT_MAX - (read_u32(data) & 0xFFFF);`).")
+    if cwes & {"CWE-674", "CWE-770", "CWE-789", "CWE-121"}:
+        blocks.append(
+            "- Bug class is *uncontrolled recursion / resource exhaustion* "
+            "(CWE-674/770/789/121). Do NOT cap depth, count, repetition, "
+            "or buffer size derived from input. Let the input bytes drive "
+            "structure depth/length without an upper limit. The seed "
+            "builder must mirror this — do not clamp values used in "
+            "seed construction.")
+    if cwes & {"CWE-125", "CWE-787"}:
+        blocks.append(
+            "- Bug class is *out-of-bounds read/write* (CWE-125/787). If "
+            "the trigger applies a negative offset / OOB index to a "
+            "buffer, allocate a LARGE buffer (>= 64 KB) before the OOB "
+            "operation so the access walks into ASan red-zone memory "
+            "rather than staying within a small same-allocation region.")
+    if not blocks:
+        return []
+    return [
+        "",
+        "## CWE-class trigger guidance (mandatory — overrides general "
+        "harness conventions):",
+    ] + blocks + [""]
+
+
 def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     """
     Build a libFuzzer harness prompt based on a harness_plan.json.
@@ -187,6 +236,7 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     """
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     entry = plan["vuln_entry"]
+    vuln_description = entry.get("description", "") or ""
     sink_usr = plan["sink_usr"]
     wrapper_path = plan["wrapper_path"]
     usr_to_file = plan["usr_to_file"]
@@ -264,9 +314,6 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     lines.append("")
     lines.append("## Vulnerability Information")
     lines.append("")
-    # Only include essential fields — exclude noisy raw data (patch_diffs,
-    # trigger_condition, enrichment_references, etc.) which are presented
-    # in dedicated curated sections below.
     curated_entry = {}
     for k in ('cve-id', 'cwe-id', 'description', 'affected-file',
               'affected-function', 'package-name', 'severity'):
@@ -275,13 +322,19 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     lines.append(json.dumps(curated_entry, indent=2))
     lines.append("")
 
-    # Add vulnerability description if available (from CVE advisory or user-provided)
-    vuln_description = entry.get('description', '')
-    if vuln_description:
-        lines.append("## Vulnerability Description")
-        lines.append("")
-        lines.append(str(vuln_description))
-        lines.append("")
+    # Direct-trigger pattern guidance
+    lines.append("## Direct Trigger Pattern Guidance")
+    lines.append("")
+    lines.append("When `protocol_steps` describes a documented direct trigger sequence "
+                 "(e.g. 'call X, then call Y with arg=INT_MAX'), execute that sequence "
+                 "as a deterministic prefix using ALL input bytes. Do not gate it "
+                 "through `selector % N` lotteries. Use input bytes only for the "
+                 "*value* near the bug threshold:")
+    lines.append("")
+    lines.append("    int len = INT_MAX - (data[0] | (data[1] << 8));   // input drives value")
+    lines.append("    XML_Parse(parser, \"\\n\", 1, XML_FALSE);            // documented setup")
+    lines.append("    XML_GetBuffer(parser, len);                       // documented trigger")
+    lines.append("")
 
     # Add fix patch context if available (from CVE enrichment)
     patch_diffs = entry.get('patch_diffs', [])
@@ -352,7 +405,7 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
         trigger_function_source=_trigger_func_source,
         entry_function_name=public_api_name,
         entry_function_source=entry_source,
-        description=str(vuln_description),
+        description=str(vuln_description) if vuln_description else "",
         cache_dir=cache_dir,
         cve_id=cve_id,
     )
@@ -379,6 +432,46 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
         if input_req:
             lines.append("**Input requirements:** {}".format(input_req))
             lines.append("")
+
+    # -- CWE-190 Integer Overflow: state-shortcutting guidance --
+    cwe_id = entry.get('cwe-id', '')
+    if cwe_id and 'CWE-190' in str(cwe_id):
+        lines.append("## Integer Overflow Fuzzing Guidance (CWE-190)")
+        lines.append("")
+        lines.append("This vulnerability is an integer overflow (CWE-190).")
+        lines.append("The overflow occurs in the library's internal arithmetic check,")
+        lines.append("causing it to SKIP buffer extension and then perform an OOB write.")
+        lines.append("")
+        lines.append("**CRITICAL — DO NOT clamp the size parameter:**")
+        lines.append("The `size` / `length` parameter passed to the vulnerable function")
+        lines.append("must be derived directly from fuzz input as a LARGE integer")
+        lines.append("(near `INT_MAX`). Do NOT clamp it to the actual payload buffer length.")
+        lines.append("The overflow happens in the library's internal `position + size + 1`")
+        lines.append("arithmetic, and ASAN will catch the resulting OOB write.")
+        lines.append("")
+        lines.append("**Required pattern for the harness:**")
+        lines.append("```c++")
+        lines.append("// Allocate a static backing buffer — NOT sized to the trigger length.")
+        lines.append("// The library's OOB write will be caught by ASAN before the")
+        lines.append("// memcpy reads all of this buffer.")
+        lines.append("static char backing[4096] = {0};")
+        lines.append("")
+        lines.append("auto *obj = library_new();")
+        lines.append("// Derive size from fuzz input: values near INT_MAX trigger overflow")
+        lines.append("int trigger_size = INT_MAX - (data[0] & 0xff);")
+        lines.append("// Call with the large size — the library's arithmetic overflows,")
+        lines.append("// skipping buffer extension, causing heap-buffer-overflow.")
+        lines.append("library_append(obj, backing, trigger_size);")
+        lines.append("```")
+        lines.append("")
+        lines.append("This works because `bpos + trigger_size + 1` wraps to a negative")
+        lines.append("value, making the size check false, so the library writes")
+        lines.append("`trigger_size` bytes into a tiny buffer. ASAN catches this immediately.")
+        lines.append("")
+        lines.append("**State shortcutting (alternative):** If the struct has accessible")
+        lines.append("position/size fields, you may also set them to near-`INT_MAX` values")
+        lines.append("directly after construction to test overflow with smaller size values.")
+        lines.append("")
 
     # -- Trigger Condition Analysis (extracted from patch diff) --
     # When the LLM-synthesized trigger protocol is available, it supersedes
@@ -471,7 +564,7 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
 
         # Show all discovered paths if more than one
         if len(all_call_paths) > 1:
-            lines.append("### All Discovered Call Paths (ranked by taint score)")
+            lines.append("### All Discovered Call Paths (ranked by data-flow score)")
             lines.append("")
             for i, pinfo in enumerate(all_call_paths[:8]):
                 path = pinfo.get('path', [])
@@ -630,6 +723,31 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
         if input_model.get('evidence'):
             lines.append("Why this matters:")
             append_bullets(lines, input_model.get('evidence', []))
+
+    # -- Structured-format + size-overflow: raw-byte approach guidance --
+    _im_primary = (input_model.get('primary', '') if input_model else '')
+    _cwe_str = str(entry.get('cwe-id', ''))
+    _is_size_overflow = any(c in _cwe_str for c in ('CWE-190', 'CWE-787', 'CWE-122'))
+    if _im_primary == 'structured-format' and _is_size_overflow:
+        lines.append("")
+        lines.append("## Raw-byte approach for structured-format overflows")
+        lines.append("")
+        lines.append("**CRITICAL:** The vulnerability is a size/integer overflow triggered")
+        lines.append("by dimension or length fields inside a structured file format header.")
+        lines.append("Do NOT construct the format from scratch with clamped dimension values —")
+        lines.append("that prevents the overflow from being reached.")
+        lines.append("")
+        lines.append("Instead, use a **raw-byte** approach:")
+        lines.append("1. Pass the fuzz input data directly as the file format bytes")
+        lines.append("   (via memory-mapped I/O callbacks or writing to a temp file).")
+        lines.append("2. Let the library's parser process the raw bytes, including any")
+        lines.append("   dimension/size fields the fuzzer mutates to extreme values.")
+        lines.append("3. Cap only the OUTPUT buffer allocation (e.g. limit raster to 256K pixels)")
+        lines.append("   to prevent OOM, but do NOT cap the values read from the header.")
+        lines.append("")
+        lines.append("This lets the fuzzer freely explore corner-case dimension values")
+        lines.append("that trigger integer overflow in internal size calculations.")
+        lines.append("")
 
     if workload_model:
         # Only emit workload model if it has meaningful operators (not just
@@ -856,6 +974,7 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     # internal analysis and reference parameters/state the harness cannot
     # control through the public API entry point.
 
+    lines.extend(_cwe_specific_guidance(plan))
     lines.append("## Output Format")
     lines.append("")
     lines.append("Generate a single C++ file `fuzzer.cc` containing:")
@@ -872,6 +991,71 @@ def build_harness_prompt(root: Path, plan_path: Path, out_dir: Path) -> Path:
     if public_api_name:
         lines.append("")
         lines.append("Target function: `" + str(public_api_name) + "()`")
+
+    # Embed the allow-list of public/exported library symbols so the LLM
+    # avoids referencing static/internal helpers or symbols that do not
+    # exist in this version of the library. Generic: derived from header
+    # cross-reference + nm/readelf output, no library-specific knowledge.
+    if public_api_names:
+        # Cap at 200 symbols to keep prompt tokens bounded; sort for
+        # deterministic ordering and reproducible caching.
+        capped = sorted(public_api_names)[:200]
+        lines.append("")
+        lines.append("## Allowed Library Symbols (Public ABI)")
+        lines.append("")
+        lines.append("Only call functions from the list below. If a function you")
+        lines.append("would naturally use is NOT in this list, it is internal/static")
+        lines.append("or does not exist in this library version - choose a different")
+        lines.append("public API. Do NOT invent symbols (e.g. *Ext, *Ex, *2 variants)")
+        lines.append("that are not in this list.")
+        lines.append("")
+        lines.append("```")
+        lines.append(" ".join(capped))
+        lines.append("```")
+
+    # Emit concrete signatures for the most-likely-needed APIs so the
+    # LLM does not have to guess parameter types. The plan ships a
+    # curated subset (wrapper-path + setup/update/cleanup candidates +
+    # prefix-matching siblings).
+    sig_dict = plan.get('public_signatures') or {}
+    if sig_dict:
+        lines.append("")
+        lines.append("## Relevant API Signatures")
+        lines.append("")
+        lines.append("Use these exact parameter types. Do NOT invent overloads,")
+        lines.append("`*Ext` variants, extra arguments, or callback signatures")
+        lines.append("not shown here.")
+        lines.append("")
+        lines.append("```c")
+        # Render in stable order: target first, then wrapper path,
+        # then alphabetical for the rest.
+        ordered = []
+        seen = set()
+        target = plan.get('public_api_name')
+        if target and target in sig_dict:
+            ordered.append(target)
+            seen.add(target)
+        for fn in plan.get('wrapper_path', []) or []:
+            nm = plan.get('usr_to_name', {}).get(fn, fn)
+            if nm in sig_dict and nm not in seen:
+                ordered.append(nm)
+                seen.add(nm)
+        for nm in sorted(sig_dict.keys()):
+            if nm not in seen:
+                ordered.append(nm)
+                seen.add(nm)
+        for nm in ordered:
+            params = sig_dict[nm] or []
+            if params:
+                rendered = ", ".join(
+                    "{} {}".format(t, n).strip() if n else t
+                    for t, n in params
+                )
+            else:
+                rendered = "void"
+            lines.append("{}({});".format(nm, rendered))
+        lines.append("```")
+
     lines.append("")
     lines.append("Generate ONLY the C++ code. No explanation, no markdown, no placeholders, no TODO comments.")
     

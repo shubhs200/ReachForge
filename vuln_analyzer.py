@@ -55,10 +55,23 @@ SUPPORT_OBJECT_HINTS = [
 
 WEAK_SUPPORT_OBJECTS = set(['metadata-structure', 'transform-config'])
 
+_CAMEL_BOUNDARY_RE = re.compile(r'([a-z])([A-Z])')
+
+def _split_name_tokens(name: str):
+    """Split a C identifier into lowercase tokens on ``_``, digits, and camelCase boundaries."""
+    # Insert a separator at camelCase boundaries: contentType → content_Type
+    expanded = _CAMEL_BOUNDARY_RE.sub(r'\1_\2', name)
+    return [t.lower() for t in re.split(r'[_\d]+', expanded) if t]
+
+
+def _name_has_token(name: str, token: str) -> bool:
+    """Return True if *token* appears as an independent word in *name*."""
+    return token.lower() in _split_name_tokens(name)
+
 
 def _is_size_like_parameter_name(name: str) -> bool:
     lowered = (name or '').lower()
-    return lowered.startswith('num') or any(token in lowered for token in ['len', 'size', 'count', 'capacity', 'avail'])
+    return lowered.startswith('num') or any(_name_has_token(name, t) for t in ['len', 'length', 'size', 'count', 'capacity', 'avail'])
 
 
 def _split_arguments(arg_text: str) -> List[str]:
@@ -396,22 +409,38 @@ def extract_function_parameters(source_code: str, function_name: str) -> List[Di
     return params
 
 
+# Tokens that require word-boundary matching in parameter names to avoid
+# false positives (e.g. 'type' inside 'content_type', 'out' inside 'layout').
+_CONTROL_NAME_TOKENS = ['mode', 'type', 'flag', 'flags', 'option', 'options', 'kind', 'op', 'cmd', 'flush']
+_OUTPUT_NAME_TOKENS = ['out', 'dst', 'dest', 'result', 'output']
+_STATE_NAME_TOKENS = ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'info', 'strm']
+_SUPPORT_NAME_TOKENS = ['table', 'array', 'list', 'entry', 'entries', 'palette', 'hist', 'map']
+_SUPPORT_TYPE_TOKENS = ['table', 'array', 'list', 'palette', 'hist']
+
+VALID_PARAMETER_ROLES = frozenset([
+    'state', 'input-buffer', 'size', 'control',
+    'output-buffer', 'support-buffer', 'numeric', 'value',
+])
+
+
 def classify_parameter_role(param_name: str, param_type: str) -> Dict[str, str]:
     """Classify how a parameter should be treated by the harness."""
-    name = (param_name or '').lower()
+    orig_name = param_name or ''
+    name = orig_name.lower()
     type_name = (param_type or '').lower()
 
-    if _is_size_like_parameter_name(name):
+    if _is_size_like_parameter_name(orig_name):
         return {
             'role': 'size',
             'strategy': 'derive from payload length or a bounded integer extracted from fuzzer input'
         }
-    if any(token in name for token in ['mode', 'type', 'flag', 'flags', 'option', 'options', 'kind', 'op', 'cmd', 'flush']):
+    if any(_name_has_token(orig_name, t) for t in _CONTROL_NAME_TOKENS):
         return {
             'role': 'control',
             'strategy': 'map a few fuzzer bits to valid enum or flag values to explore alternate branches'
         }
-    if any(token in name for token in ['out', 'dst', 'dest', 'result', 'output', 'return']):
+    # 'return' is a keyword — only match the exact name, not as a substring.
+    if any(_name_has_token(orig_name, t) for t in _OUTPUT_NAME_TOKENS) or name == 'return':
         return {
             'role': 'output-buffer',
             'strategy': 'allocate a bounded writable buffer owned by the harness before the call'
@@ -421,22 +450,22 @@ def classify_parameter_role(param_name: str, param_type: str) -> Dict[str, str]:
             'role': 'output-buffer',
             'strategy': 'allocate a bounded writable buffer owned by the harness before the call'
         }
-    if any(token in name for token in ['state', 'ctx', 'context', 'stream', 'parser', 'handle', 'object', 'info', 'strm']) or (name.endswith('_ptr') and not any(token in name for token in ['buf', 'data', 'text', 'str'])) or '%struct' in type_name or (type_name.endswith('ptr') and '*' not in type_name):
+    if any(_name_has_token(orig_name, t) for t in _STATE_NAME_TOKENS) or (name.endswith('_ptr') and not any(t in name for t in ['buf', 'data', 'text', 'str'])) or '%struct' in type_name or (type_name.endswith('ptr') and '*' not in type_name):
         return {
             'role': 'state',
             'strategy': 'create or initialize a valid state object before invoking the target API'
         }
-    if any(token in name for token in ['table', 'array', 'list', 'entry', 'entries', 'palette', 'hist', 'map']) or any(token in type_name for token in ['table', 'array', 'list', 'palette', 'hist']):
+    if any(_name_has_token(orig_name, t) for t in _SUPPORT_NAME_TOKENS) or any(t in type_name for t in _SUPPORT_TYPE_TOKENS):
         return {
             'role': 'support-buffer',
             'strategy': 'allocate a bounded typed buffer or table and populate it from fuzz-controlled values while preserving count consistency'
         }
-    if '*' in type_name or 'char' in type_name or 'uint8' in type_name or 'int8' in type_name or 'void' in type_name:
+    if '*' in type_name or 'char' in type_name or 'uint8' in type_name or 'int8' in type_name or 'void' in type_name or 'byte' in type_name:
         return {
             'role': 'input-buffer',
             'strategy': 'back with fuzz-controlled bytes, preserving required alignment or termination rules'
         }
-    if any(token in type_name for token in ['int', 'long', 'short', 'size_t', 'ssize_t', 'uint', 'float', 'double']):
+    if any(re.search(r'\b' + t + r'\b', type_name) for t in ['int', 'long', 'short', 'size_t', 'ssize_t', 'uint', 'float', 'double']):
         return {
             'role': 'numeric',
             'strategy': 'extract a bounded scalar from fuzzer input and clamp it to valid ranges'

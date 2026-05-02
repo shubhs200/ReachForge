@@ -17,10 +17,10 @@ class LLVMCallGraphBuilder:
     1. Track address-taken functions (store @func, ...)
     2. Track function pointer field assignments
     3. Resolve indirect calls via pointer analysis
-    4. Track parameter types for taint analysis
+    4. Track parameter types for data-flow scoring
     """
     
-    def __init__(self):
+    def __init__(self, max_targets_per_call=24):
         # Function info
         self.functions = {}  # name -> {defined: bool, location: str, params: [(type, name)]}
         
@@ -38,7 +38,13 @@ class LLVMCallGraphBuilder:
         # avoid conflating unrelated variables that share a numeric name.
         self.pointer_targets = defaultdict(set)  # (func, ptr_name) -> {func_names}
         
-        # Parameter flow tracking for taint analysis
+        # Configurable limit: indirect calls resolving to more than this many
+        # targets are discarded as likely imprecise (e.g. generic callback
+        # registries).  Default 24 is the largest observed dispatch table size
+        # in our benchmark libraries (expat's 22 parser handlers).
+        self.max_targets_per_call = max_targets_per_call
+        
+        # Parameter flow tracking for path scoring
         # call_args[(caller, callee)] = [(caller_param_idx, callee_param_idx), ...]
         self.call_args = defaultdict(list)
         self.call_sites = defaultdict(list)  # (caller, callee) -> [[arg1, arg2, ...], ...]
@@ -50,10 +56,11 @@ class LLVMCallGraphBuilder:
         # Pattern handles: define internal fastcc void @func(%struct* %arg, i8* %data) {
         self.func_def_pattern = re.compile(r'^define\s+.*?@([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
         self.func_decl_pattern = re.compile(r'^declare\s+.*?@([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
-        self.direct_call_pattern = re.compile(r'call\s+[^@]*@([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)')
+        self.direct_call_pattern = re.compile(r'(?:call|invoke)\s+[^@]*@([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)')
         # Indirect calls in LLVM IR look like: call i32 %5(i8* %6) or call i32 %funcptr(...)
+        # Also match invoke (used in C++ code with exception handling)
         # Match both numbered (%5) and named (%funcptr) locals
-        self.indirect_call_pattern = re.compile(r'call\s+[^@]*?%([a-zA-Z0-9_.]+)\s*\(')
+        self.indirect_call_pattern = re.compile(r'(?:call|invoke)\s+[^@]*?%([a-zA-Z0-9_.]+)\s*\(')
         # Store of function address: store ... @func, ... %ptr
         # Use greedy .* for the destination register so we skip past %struct.X
         # type annotations and capture the actual register operand (the last
@@ -70,17 +77,37 @@ class LLVMCallGraphBuilder:
         # Companion pattern to detect when the source is a global (starts with @)
         self.load_global_pattern = re.compile(r'%([a-zA-Z0-9_.]+)\s*=\s*load\s+.*?@([a-zA-Z_][a-zA-Z0-9_.]*)')
         # GEP (getelementptr) pattern for struct-field function pointer tracking.
-        # Captures: dst_register, struct_type, field_index
+        # Captures: dst_register, struct_type, base_register, field_index
         # Example: %6 = getelementptr inbounds %struct.XML_ParserStruct, %struct.XML_ParserStruct* %5, i32 0, i32 45
         self.gep_pattern = re.compile(
             r'%([a-zA-Z0-9_.]+)\s*=\s*getelementptr\s+(?:inbounds\s+)?'
             r'(%(?:struct|class|union)\.[a-zA-Z0-9_.]+)\s*,'
+            r'\s*[^,]*%([a-zA-Z0-9_.]+)\s*,'
             r'.*?(?:i32|i64)\s+0\s*,\s*(?:i32|i64)\s+(\d+)'
         )
         # Maps (owning_func, register) -> (struct_type, field_index)
         self.gep_info = {}
+        # Maps (owning_func, dst_register) -> (owning_func, base_register)
+        # Used for nested GEP chaining (e.g. ctx->handlers->on_data)
+        self.gep_base = {}
         # Maps (struct_type, field_index) -> {function_names stored into that field}
         self.struct_field_targets = defaultdict(set)
+        
+        # ---- Vtable (C++ virtual dispatch) support ----
+        # Maps vtable global name -> [function_name_or_None, ...] indexed by slot
+        self.vtable_entries = {}   # e.g. '_ZTV4Base' -> ['_ZN4Base3fooEv', ...]
+        # Maps (owning_func, register) -> (vtable_global, slot_index)
+        # Populated when we see the load-vptr → GEP-vtable → load-fptr pattern
+        self.vtable_slot_info = {}
+        # GEP pattern for vtable slot indexing (bare-pointer GEP without struct type):
+        #   %vfn = getelementptr inbounds ptr, ptr %vtable, i64 2
+        # or older typed-pointer form:
+        #   %vfn = getelementptr inbounds i8* (%class.Base*)**, i8* (%class.Base*)*** %vtable, i64 2
+        self.vtable_gep_pattern = re.compile(
+            r'%([a-zA-Z0-9_.]+)\s*=\s*getelementptr\s+(?:inbounds\s+)?'
+            r'(?:ptr|[^,]+\*+)\s*,\s*(?:ptr|[^,]+\*+)\s+%([a-zA-Z0-9_.]+)\s*,\s*'
+            r'(?:i32|i64)\s+(\d+)\s*$'
+        )
         
         # Track which registers point to which memory locations
         self.register_to_memory = {}  # register -> memory_location
@@ -265,12 +292,12 @@ class LLVMCallGraphBuilder:
         data_param_indices = []
         for i, (ptype, pname) in enumerate(params):
             if self._is_data_pointer_type(ptype):
-                # Additional heuristics: buffer parameters often have names like:
-                # data, buf, buffer, input, s, ptr, p
                 # Exclude: parser, ctx, context, handle, state (internal structs)
+                # Covers both C naming (ctx, state) and C++ (this, self, instance)
                 pname_lower = pname.lower()
                 exclude_names = ['parser', 'ctx', 'context', 'handle', 'state', 
-                                 'self', 'this', 'instance', 'userdata']
+                                 'self', 'this', 'instance', 'userdata',
+                                 'allocator', 'deleter', 'traits']
                 if not any(ex in pname_lower for ex in exclude_names):
                     data_param_indices.append(i)
         return data_param_indices
@@ -285,8 +312,30 @@ class LLVMCallGraphBuilder:
                 control_param_indices.append(i)
         return control_param_indices
 
+    def _resolve_reg_to_param(self, func, reg, caller_name_to_index, depth=0):
+        """Resolve a register to a caller parameter index, following GEP chains.
+
+        Returns the caller parameter index if *reg* (or a GEP base of *reg*)
+        matches a caller parameter, else ``None``.  Follows up to 2 levels of
+        GEP indirection (e.g. ``param->field`` and ``param->sub->field``).
+        """
+        if reg in caller_name_to_index:
+            return caller_name_to_index[reg]
+        if depth >= 2:
+            return None
+        base_key = self.gep_base.get((func, reg))
+        if base_key is None:
+            return None
+        _, base_reg = base_key
+        return self._resolve_reg_to_param(func, base_reg, caller_name_to_index, depth + 1)
+
     def get_edge_param_flow(self, caller, callee):
-        """Map caller parameter indices to callee parameter indices using recorded call sites."""
+        """Map caller parameter indices to callee parameter indices using recorded call sites.
+
+        Extends plain SSA-register identity with GEP tracing so that
+        arguments derived from ``getelementptr`` on a caller parameter (the
+        common ``param->field`` pattern) are still counted as forwarded.
+        """
         key = (caller, callee)
         if key in self.call_args and self.call_args[key]:
             return self.call_args[key]
@@ -305,8 +354,11 @@ class LLVMCallGraphBuilder:
         for arg_list in self.call_sites.get(key, []):
             for callee_index, arg_text in enumerate(arg_list[:len(callee_params)]):
                 reg = self._extract_arg_register(arg_text)
-                if reg and reg in caller_name_to_index:
-                    mapping = (caller_name_to_index[reg], callee_index)
+                if not reg:
+                    continue
+                param_idx = self._resolve_reg_to_param(caller, reg, caller_name_to_index)
+                if param_idx is not None:
+                    mapping = (param_idx, callee_index)
                     if mapping not in seen:
                         seen.add(mapping)
                         flows.append(mapping)
@@ -325,6 +377,37 @@ class LLVMCallGraphBuilder:
         
         lines = content.split('\n')
         current_func = None
+        
+        # ---- Parse vtable globals (@_ZTV*) for C++ virtual dispatch ----
+        # Vtable constants look like:
+        #   @_ZTV4Base = ... constant { [4 x ptr] } { [4 x ptr] [ptr null, ptr @_ZTI4Base, ptr @_ZN4Base3fooEv, ptr @_ZN4Base3barEv] }, ...
+        # We extract function names from each slot position.
+        vtable_pattern = re.compile(
+            r'^@(_ZTV[a-zA-Z0-9_]+)\s*=.*?(?:constant|global)\s+.*?\{.*?\[.*?\]\s*\[([^\]]+)\]'
+        )
+        for line in lines:
+            m = vtable_pattern.match(line)
+            if not m:
+                continue
+            vtable_name = m.group(1)
+            entries_str = m.group(2)
+            # Parse slot entries: "ptr null, ptr @_ZTI4Base, ptr @_ZN4Base3fooEv, ..."
+            slot_entries = []
+            for entry in entries_str.split(','):
+                entry = entry.strip()
+                func_match = re.search(r'@([a-zA-Z_][a-zA-Z0-9_]*)', entry)
+                if func_match:
+                    fname = func_match.group(1)
+                    # Skip typeinfo and typeinfo-name entries
+                    if fname.startswith('_ZTI') or fname.startswith('_ZTS'):
+                        slot_entries.append(None)
+                    else:
+                        slot_entries.append(fname)
+                else:
+                    slot_entries.append(None)  # null or non-function entry
+            if slot_entries:
+                self.vtable_entries[vtable_name] = slot_entries
+                print("DEBUG LLVM: Parsed vtable @" + vtable_name + " with " + str(len(slot_entries)) + " slots")
         
         # Join continuation lines for function definitions
         # LLVM IR function definitions can span multiple lines
@@ -465,8 +548,20 @@ class LLVMCallGraphBuilder:
             for match in self.gep_pattern.finditer(line):
                 dst_reg = match.group(1)
                 struct_type = match.group(2)
-                field_idx = int(match.group(3))
+                base_reg = match.group(3)
+                field_idx = int(match.group(4))
                 self.gep_info[(current_func, dst_reg)] = (struct_type, field_idx)
+                # Record base register for nested GEP chaining
+                self.gep_base[(current_func, dst_reg)] = (current_func, base_reg)
+            
+            # Track vtable-style GEP (bare-pointer indexing without struct type).
+            # Pattern: %vfn = getelementptr inbounds ptr, ptr %vtable, i64 2
+            # This produces a pointer to the vtable slot at the given index.
+            for match in self.vtable_gep_pattern.finditer(line):
+                dst_reg = match.group(1)
+                base_reg = match.group(2)
+                slot_idx = int(match.group(3))
+                self.vtable_slot_info[(current_func, dst_reg)] = (base_reg, slot_idx)
             
             i += 1  # Move to next line
     
@@ -504,6 +599,46 @@ class LLVMCallGraphBuilder:
             if len(self.pointer_targets[dst_key]) > old_size:
                 print("DEBUG LLVM: Struct-field bridge: seeded (" + str(owner) + ", " + str(dst_ptr) + ") from " + str(field_key) + " -> " + str(targets))
 
+        # Step 2b: Nested GEP chaining.
+        # When %A = GEP %struct.Ctx, %ctx, 0, 3   (gep_info -> (Ctx, 3))
+        # and  %B = GEP %struct.Handlers, %A, 0, 2 (gep_info -> (Handlers, 2))
+        # then struct_field_targets for (Handlers, 2) should propagate through
+        # the chain to any load from %B.  We achieve this by seeding
+        # struct_field_targets from inner-level GEPs whose base register is
+        # itself a GEP result, then re-running the Step 2 bridge.
+        chained_any = False
+        for (func, dst_reg), (struct_type, field_idx) in list(self.gep_info.items()):
+            base_key = self.gep_base.get((func, dst_reg))
+            if not base_key or base_key not in self.gep_info:
+                continue
+            # dst_reg is a nested GEP whose base is also a GEP result.
+            # The inner field (struct_type, field_idx) is reachable through
+            # the outer struct.  Propagate any known targets into the
+            # pointer_targets for dst_reg so downstream loads can resolve.
+            inner_targets = self.struct_field_targets.get((struct_type, field_idx))
+            if inner_targets:
+                dst_key = (func, dst_reg)
+                old_size = len(self.pointer_targets[dst_key])
+                self.pointer_targets[dst_key].update(inner_targets)
+                if len(self.pointer_targets[dst_key]) > old_size:
+                    chained_any = True
+                    print("DEBUG LLVM: Nested GEP chain: seeded (" + str(func) + ", " + str(dst_reg) + ") via " + str((struct_type, field_idx)) + " -> " + str(inner_targets))
+
+        # Re-run Step 2 bridge if chaining produced new targets so loads
+        # from nested GEP registers pick them up.
+        if chained_any:
+            for dst_ptr, src_ptr, loc, owner in self.func_ptr_stores:
+                src_gep_key = (owner, src_ptr)
+                if src_gep_key not in self.gep_info:
+                    continue
+                field_key = self.gep_info[src_gep_key]
+                targets = self.struct_field_targets.get(field_key)
+                if not targets:
+                    continue
+                dst_key = (owner, dst_ptr)
+                old_size = len(self.pointer_targets[dst_key])
+                self.pointer_targets[dst_key].update(targets)
+
         # Iterate to propagate pointer targets (flow-insensitive, but works for most cases)
         changed = True
         iterations = 0
@@ -530,14 +665,50 @@ class LLVMCallGraphBuilder:
                         if len(self.pointer_targets[key]) > old_size:
                             changed = True
         
+        # ---- Vtable resolution ----
+        # Resolve the load-vptr → GEP-vtable → load-fptr → call/invoke pattern.
+        # For each vtable GEP slot info (func, dst_reg) -> (base_reg, slot_idx),
+        # trace the base_reg back to a load from a global @_ZTV* vtable.
+        # If found, seed pointer_targets for the register that loaded from
+        # the GEP result (i.e. the function pointer).
+        vtable_resolved = 0
+        for (func, gep_dst), (base_reg, slot_idx) in self.vtable_slot_info.items():
+            # The base_reg should have been loaded from a vtable global.
+            # Check if we have pointer_targets for (func, base_reg) that
+            # correspond to vtable globals, or check load records.
+            # In practice, the base_reg comes from:
+            #   %vtable = load ptr, ptr %obj  (loads vptr from object)
+            # and there's an earlier store of @_ZTV... + offset to the object.
+            # We check all known vtable globals for a matching slot.
+
+            # Find what loads from this GEP result (i.e. who loads the fptr)
+            for dst_ptr, src_ptr, loc, owner in self.func_ptr_stores:
+                if owner != func or src_ptr != gep_dst:
+                    continue
+                # dst_ptr is the register that holds the loaded function pointer.
+                # Try all vtables — the slot_idx selects the virtual method.
+                for vtable_name, slots in self.vtable_entries.items():
+                    if slot_idx < len(slots) and slots[slot_idx] is not None:
+                        target = slots[slot_idx]
+                        if target in self.functions or not target.startswith('_ZTI'):
+                            key = (func, dst_ptr)
+                            old_size = len(self.pointer_targets[key])
+                            self.pointer_targets[key].add(target)
+                            if len(self.pointer_targets[key]) > old_size:
+                                vtable_resolved += 1
+                                print("DEBUG LLVM: Vtable resolution: (" + str(func) + ", " + str(dst_ptr) + ") -> " + str(target) + " via @" + str(vtable_name) + "[" + str(slot_idx) + "]")
+        
+        if vtable_resolved:
+            print("DEBUG LLVM: Resolved " + str(vtable_resolved) + " vtable dispatch targets")
+        
         # Now resolve indirect calls.
         # Struct-field dispatch (e.g. expat's m_processor) can legitimately
-        # have 15-20+ targets; allow up to 24 before considering imprecise.
-        max_targets_per_call = 24
+        # have 15-20+ targets; allow up to max_targets_per_call before
+        # considering imprecise.
         for caller, ptr_name, location in self.indirect_calls:
             targets = self.pointer_targets.get((caller, ptr_name), set())
             if targets:
-                if len(targets) > max_targets_per_call:
+                if len(targets) > self.max_targets_per_call:
                     print("DEBUG LLVM: Skipping over-resolved indirect call in " + str(caller) + " via '" + str(ptr_name) + "' (" + str(len(targets)) + " targets, likely imprecise)")
                     continue
                 for target in targets:
@@ -574,16 +745,22 @@ class LLVMCallGraphBuilder:
         
         return adjacency, usr_to_file, usr_to_name
     
-    def score_path_taint(self, path):
+    def score_path(self, path):
         """
-        Score a path based on taint propagation potential.
+        Score a call path by parameter-propagation potential.
         Higher score = better path (more likely to pass external data to sink).
-        
-        Scoring:
-        - Entry point with data params: +10
-        - Each hop: -1 (prefer shorter paths)
-        - Entry point with "Free/Destroy/Cleanup" in name: -5
-        - Penalty for internal-looking function names (Xml* vs XML_*)
+
+        Evaluates the *entry point* (path[0]) for data/control parameters
+        and naming signals, then traces parameter forwarding along each
+        call edge to estimate how much fuzzer-controlled data survives to
+        the sink.
+
+        The caller is responsible for pre-filtering paths to public API
+        entry points before scoring; this function only ranks viable
+        candidates on data-flow merit.
+
+        Args:
+            path: list of function names [entry, ..., sink].
         """
         if not path or len(path) < 1:
             return -1000
@@ -601,80 +778,73 @@ class LLVMCallGraphBuilder:
         if entry_control_params:
             score += 4 * min(2, len(entry_control_params))
         
-        # Penalty for cleanup functions
+        # Penalty for cleanup functions (C and C++ patterns)
         entry_lower = entry.lower()
-        if 'free' in entry_lower or 'destroy' in entry_lower or 'cleanup' in entry_lower:
+        # Strip C++ namespace/class qualifiers for name matching
+        entry_basename = entry_lower.rsplit('::', 1)[-1] if '::' in entry_lower else entry_lower
+        if any(kw in entry_basename for kw in ('free', 'destroy', 'cleanup', 'release',
+                                                 'deallocate', 'dispose')):
             score -= 15
-        if 'reset' in entry_lower or 'close' in entry_lower:
+        if any(kw in entry_basename for kw in ('reset', 'close', 'shutdown', 'finalize')):
             score -= 10
+        # C++ destructors (mangled names contain 'D0', 'D1', 'D2' or ~ClassName)
+        if entry_basename.startswith('~') or '::~' in entry_lower:
+            score -= 15
         
-        # Bonus for parse/process/handle/run functions (likely data processors)
-        if 'parse' in entry_lower or 'process' in entry_lower:
+        # Bonus for data-processing functions (C and C++ patterns)
+        if any(kw in entry_basename for kw in ('parse', 'process', 'decode', 'deserialize',
+                                                 'unmarshal', 'from_', 'load')):
             score += 8
-        if 'handle' in entry_lower or 'run' in entry_lower or 'execute' in entry_lower:
+        if any(kw in entry_basename for kw in ('handle', 'run', 'execute', 'dispatch',
+                                                 'invoke', 'apply', 'transform')):
             score += 5
+        # C++ iterator/container methods are poor entry points
+        if entry_basename in ('begin', 'end', 'cbegin', 'cend', 'rbegin', 'rend',
+                              'size', 'empty', 'clear', 'swap', 'at', 'front', 'back',
+                              'push_back', 'pop_back', 'emplace_back', 'insert', 'erase',
+                              'emplace', 'resize', 'reserve', 'capacity'):
+            score -= 8
+        # C++ operator overloads are poor entry points
+        if entry_basename.startswith('operator'):
+            score -= 8
         
         # SMALL penalty for each hop (prefer shorter paths, but not as much as data flow)
         score -= len(path) - 1
 
-        # Score actual caller->callee parameter propagation along the chosen path.
-        tainted_params = set(entry_data_params + entry_control_params)
-        if tainted_params:
-            score += 3
+        # Trace caller→callee parameter propagation along the path.
+        tracked_params = set(entry_data_params + entry_control_params)
         for index in range(len(path) - 1):
             caller = path[index]
             callee = path[index + 1]
             edge_flow = self.get_edge_param_flow(caller, callee)
             if not edge_flow:
                 score -= 2
-                tainted_params = set()
+                tracked_params = set()
                 continue
 
-            next_tainted = set()
+            next_tracked = set()
             propagated = 0
             for caller_param_idx, callee_param_idx in edge_flow:
-                if caller_param_idx in tainted_params:
-                    next_tainted.add(callee_param_idx)
+                if caller_param_idx in tracked_params:
+                    next_tracked.add(callee_param_idx)
                     propagated += 1
 
             if propagated:
                 score += 8 * propagated
-                tainted_params = next_tainted
+                tracked_params = next_tracked
             else:
                 score -= 1
-                tainted_params = next_tainted
+                tracked_params = next_tracked
 
-        # Extra bonus if some entry-controlled parameter evidence survives all the way to the sink.
-        if tainted_params:
-            score += 6 * len(tainted_params)
-        
-        # Heuristic: detect internal vs public function naming patterns
-        # Many libraries use: LIBRARY_* for public, Library* for internal
-        # Examples:
-        #   expat: XML_Parse (public) vs XmlParseXmlDecl (internal)
-        #   cJSON: cJSON_Parse (public) - no internal prefix conflict
-        #   libpng: png_* functions
-        #
-        # Pattern: If function starts with uppercase followed by lowercase (Xml, Json, Png)
-        # and contains another uppercase later, it's likely INTERNAL.
-        # If function is ALL_CAPS prefix with underscore (XML_, JSON_, PNG_), it's PUBLIC.
-        import re
-        if entry and len(entry) > 1:
-            # Check for internal pattern: Xxxx* (e.g., Xml, Json, Png followed by more)
-            # These start with uppercase, then lowercase, then more chars
-            internal_pattern = re.match(r'^[A-Z][a-z][a-zA-Z0-9]+', entry)
-            if internal_pattern:
-                # Looks like internal function (Xml*, Json*, etc.)
-                # STRONG penalty - these should rarely be selected as entry points
-                score -= 100
-            
-            # Check for public pattern: PREFIX_* (e.g., XML_, JSON_, PNG_)
-            public_pattern = re.match(r'^[A-Z][A-Z0-9]*_', entry)
-            if public_pattern:
-                # Looks like public API (XML_Parse, JSON_Parse, etc.)
-                score += 15
+        # Extra bonus if entry-controlled parameters survive to the sink.
+        if tracked_params:
+            score += 6 * len(tracked_params)
         
         return score
+
+    # Keep old name as alias for backward compatibility.
+    def score_path_taint(self, path):
+        return self.score_path(path)
 
     def trace_parameter_flow(self, path):
         """Trace data flow from entry to sink along *path*.
@@ -913,7 +1083,7 @@ def score_path_taint(path):
     if _builder_instance is None:
         # Return a default score if no builder
         return -len(path) if path else -1000
-    return _builder_instance.score_path_taint(path)
+    return _builder_instance.score_path(path)
 
 def get_func_params(func_name):
     """Get parameters for a function."""

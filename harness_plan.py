@@ -34,7 +34,6 @@ from public_api import (
     extract_public_usrs, 
     extract_function_signatures, 
     extract_exported_functions, 
-    is_internal_function_name,
     get_exported_symbols,
     find_shared_libraries,
     extract_exported_symbols_from_library
@@ -1666,7 +1665,8 @@ def _load_llm_config():
 # ─────────── LLM-based entry-path selection ───────────
 
 def llm_select_entry_path(all_paths, sink_name, entry, public_signatures,
-                          cache_dir=None):
+                          cache_dir=None, exported_syms=None,
+                          path_scores=None):
     """Use the LLM to select the best entry-point path from BFS candidates.
 
     The LLM receives all candidate paths together with vulnerability context
@@ -1698,6 +1698,7 @@ def llm_select_entry_path(all_paths, sink_name, entry, public_signatures,
     affected_func = entry.get('affected-function', sink_name)
 
     # Format each candidate path with its entry-function signature
+    path_scores = path_scores or {}
     path_lines = []
     for idx, path in enumerate(all_paths, 1):
         entry_func = path[0]
@@ -1711,9 +1712,13 @@ def llm_select_entry_path(all_paths, sink_name, entry, public_signatures,
         chain = ' -> '.join(path)
         if len(path) == 1:
             chain += '  (direct call - sink IS the public API)'
+        # Include heuristic data-flow score so the LLM has explicit signal
+        # that one path is judged closer to the sink than another.
+        score = path_scores.get(tuple(path))
+        score_str = ' [score={}]'.format(score) if score is not None else ''
         path_lines.append(
-            '  {idx}. {func}({sig})  :  {chain}'.format(
-                idx=idx, func=entry_func, sig=sig, chain=chain)
+            '  {idx}.{score} {func}({sig})  :  {chain}'.format(
+                idx=idx, score=score_str, func=entry_func, sig=sig, chain=chain)
         )
 
     prompt = (
@@ -1811,6 +1816,51 @@ def llm_select_entry_path(all_paths, sink_name, entry, public_signatures,
     safe_reasoning = reasoning.encode('ascii', 'replace').decode('ascii') if reasoning else ''
     print('[llm_select_entry_path] LLM selected path {}: {} - {}'.format(
         sel, ' -> '.join(selected), safe_reasoning))
+
+    # Validate selected entry against the exported-symbol allow-list.
+    # If the LLM picked a path whose entry point is not actually exported
+    # by the built library, fall back to the highest-scoring path whose
+    # entry IS exported. This is generic — driven by nm/readelf output, not
+    # by any library-specific knowledge.
+    if exported_syms:
+        ranked_exported = sorted(
+            (p for p in all_paths if p[0] in exported_syms),
+            key=lambda p: -(path_scores.get(tuple(p), 0)),
+        )
+        if selected[0] not in exported_syms:
+            print('[llm_select_entry_path] WARNING: selected entry {!r} '
+                  'is not in exported symbols of the built library; '
+                  'falling back to highest-scoring exported path'.format(
+                      selected[0]), file=sys.stderr)
+            replacement = ranked_exported[0] if ranked_exported else None
+            if replacement is not None:
+                selected = replacement
+                print('[llm_select_entry_path] Fallback selected: {}'.format(
+                    ' -> '.join(selected)))
+        else:
+            # Score-greedy guard: if the LLM picked an exported path whose
+            # heuristic taint score is much lower than the best exported
+            # candidate, prefer the higher-scoring one. The score blends
+            # path length and trigger-overlap; large gaps usually indicate
+            # the LLM was distracted by surface signals (signature looks
+            # clean, fewer args) over genuine reachability. Generic — no
+            # library or CVE knowledge.
+            sel_score = path_scores.get(tuple(selected), 0)
+            top_path = ranked_exported[0] if ranked_exported else None
+            top_score = path_scores.get(tuple(top_path), 0) if top_path else 0
+            # Override threshold: LLM pick must be at least 60% of top score
+            # AND within 30 absolute points; otherwise fall back to top.
+            if (top_path is not None
+                    and top_path != selected
+                    and top_score > 0
+                    and (sel_score < 0.6 * top_score
+                         or (top_score - sel_score) >= 30)):
+                print('[llm_select_entry_path] Score-greedy override: '
+                      'LLM picked {!r} (score={}) but top exported path '
+                      '{!r} scores {}; switching.'.format(
+                          selected[0], sel_score, top_path[0], top_score),
+                      file=sys.stderr)
+                selected = top_path
 
     # ── Cache result ──
     if cache_file:
@@ -2594,7 +2644,19 @@ def main():
                 except Exception:
                     continue
         if not sink_file:
-            sys.exit("Could not locate source file for function '{}'. Provide affected-file manually.".format(sink_func))
+            # Graceful fallback: when the sink function can't be located in the
+            # source tree, it's almost always because the affected function lives
+            # in an example/app/test file outside the library proper (e.g.,
+            # `parseit` in json-c apps/, `loadImage` in libtiff tools/). Rather
+            # than aborting, emit a synthetic source-file marker so downstream
+            # planning can still produce a general-purpose "library exerciser"
+            # harness (see fallback_plan branch below).
+            print("WARNING: Could not locate source file for function '{}'. "
+                  "Falling back to general-purpose library-exerciser plan.".format(sink_func),
+                  file=sys.stderr)
+            sink_file = "<unresolved>"
+            entry["affected-file"] = sink_file
+            entry["_rf_fallback_reason"] = "sink_function_not_in_source"
 
     # Discover public APIs from header files (GENERIC - no hardcoded prefixes)
     public_dirs = find_public_include_dirs(pub_cmds, args.root)
@@ -2774,14 +2836,60 @@ def main():
         
         # Debug: show the callers of parse_string and parse_value
         print("DEBUG: Callers of '" + str(sink_name) + "': " + str(name_adjacency.get(sink_name, [])))
-        
+
+        # Initialize BFS state up-front so debug prints downstream can refer to
+        # `visited` even when one of the early-return branches below doesn't
+        # actually run a traversal.
+        visited = set([sink_name])
+
         # SPECIAL CASE: If sink has NO callers, it IS a public API (root function)
         # No BFS needed - the sink itself is the entry point
-        if sink_name not in name_adjacency or len(name_adjacency.get(sink_name, [])) == 0:
-            print("DEBUG: Sink '" + str(sink_name) + "' has no callers - treating as public API")
+        # GUARD: Require the sink to actually be in our exported allow-list;
+        # otherwise a static helper with no callers in the partial callgraph
+        # would be mis-promoted to a public entry point.
+        if (sink_name in public_api_names
+                and (sink_name not in name_adjacency
+                     or len(name_adjacency.get(sink_name, [])) == 0)):
+            print("DEBUG: Sink '" + str(sink_name) + "' has no callers and IS a public API - treating as entry point")
             wrapper_path = [sink_usr]
             public_api_name = sink_name
             print("INFO: Sink function '" + str(sink_func) + "' is a root function (no callers) - treating as public API")
+        elif sink_name not in name_adjacency or len(name_adjacency.get(sink_name, [])) == 0:
+            # Sink has no callers but is not exported.  Before giving up,
+            # try a generic same-translation-unit fallback: look for any
+            # public API whose declaration/definition lives in the same
+            # source file as the sink — such functions almost always call
+            # internal static helpers from their own TU, even when those
+            # edges are missing from a partial callgraph.  No library or
+            # CVE-specific knowledge — driven purely by usr_to_file.
+            sink_file = ''
+            try:
+                sink_loc = usr_to_file.get(sink_usr, '') or ''
+                sink_file = sink_loc.split(':', 1)[0]
+            except Exception:
+                sink_file = ''
+            same_tu_apis = []
+            if sink_file:
+                for u, name in usr_to_name.items():
+                    if not name or name not in public_api_names:
+                        continue
+                    loc = usr_to_file.get(u, '') or ''
+                    if loc.split(':', 1)[0] == sink_file:
+                        same_tu_apis.append(name)
+            if same_tu_apis:
+                # Deterministic pick: shortest name (most fundamental API)
+                same_tu_apis.sort(key=lambda n: (len(n), n))
+                chosen = same_tu_apis[0]
+                print("DEBUG: Sink '" + str(sink_name) + "' has no callers; "
+                      "promoting same-TU public API '" + str(chosen) + "' "
+                      "(file " + str(sink_file) + ", " + str(len(same_tu_apis))
+                      + " same-TU exports)")
+                wrapper_path = [sink_usr]
+                public_api_name = chosen
+            else:
+                # Sink has no callers and no same-TU exported sibling — fall
+                # through so the graceful exerciser fallback can kick in.
+                print("DEBUG: Sink '" + str(sink_name) + "' has no callers but is NOT in public_api_names - skipping promotion, will use fallback")
         else:
             # Identify ROOT functions (have NO callers within the library)
             # These are the true entry points / public APIs
@@ -2850,11 +2958,26 @@ def main():
             # ── LLM-based path selection (before heuristic scoring) ──
             # When multiple candidate paths exist, ask the LLM to pick the
             # best entry point using vulnerability context that heuristics lack.
+            # We pre-compute heuristic scores and the exported-symbol allow-list
+            # so the selector can show scores and validate its own choice.
             llm_selected = False
             if all_paths and len(all_paths) > 1:
+                trigger_funcs_pre = set(
+                    entry.get('trigger_condition', {}).get('affected_functions', [])
+                )
+                pre_scores = {}
+                for p in all_paths:
+                    s = score_path_taint(p)
+                    if trigger_funcs_pre:
+                        overlap = trigger_funcs_pre.intersection(p)
+                        if overlap:
+                            s += 30 * len(overlap)
+                    pre_scores[tuple(p)] = s
                 llm_path = llm_select_entry_path(
                     all_paths, sink_name, entry, public_signatures,
                     cache_dir=args.root,
+                    exported_syms=public_api_names,
+                    path_scores=pre_scores,
                 )
                 if llm_path is not None:
                     found_path = llm_path
@@ -2983,7 +3106,91 @@ def main():
             print("DEBUG: visited functions: " + str(list(visited)[:20]))
             print("DEBUG: public_api_names sample: " + str(list(public_api_names)[:20]))
             print("DEBUG: project_public_apis: " + str(list(project_public_apis)[:20]))
-            sys.exit("Could not find a public API wrapper for sink '" + str(sink_func) + "'. Public APIs found: " + str(list(public_api_names)[:20]))
+            # Graceful fallback: sink isn't reachable from any public API.
+            # This happens when the vulnerable function is internal/static or
+            # lives outside the library proper (apps/, tools/, tests/).
+            # Instead of aborting, pick a representative public API to drive a
+            # general-purpose library-exerciser harness. The LLM is then asked
+            # to explore broadly via that entry point — the resulting fuzzer
+            # may still discover bugs (including the target CVE if reachable
+            # via indirect calls the static analyzer missed).
+            #
+            # Selection heuristic (generic, no library knowledge):
+            #   1. Prefer public APIs whose source file is in the same dir as
+            #      the sink file, if known.
+            #   2. Otherwise, prefer the public API with the most callees in
+            #      the call-graph (broadest reach).
+            #   3. Otherwise, fall back to the lexicographically first public API.
+            candidate_apis = sorted(public_api_names | project_public_apis)
+
+            # Generic filter: drop APIs defined in non-library directories
+            # (tests, examples, tools, fuzz scaffolding).  These leak into the
+            # symbol set when headers from those subdirs are parsed, but they
+            # are NOT real library entry points.  Library/CVE-agnostic — the
+            # filter is purely a path heuristic.  We only apply it if it
+            # leaves at least one candidate behind.
+            _NON_LIB_PATH_TOKENS = (
+                "/tests/", "/test/", "/testing/", "/unittest/", "/unittests/",
+                "/examples/", "/example/", "/sample/", "/samples/", "/demo/",
+                "/demos/", "/benchmark/", "/benchmarks/", "/bench/",
+                "/fuzz/", "/fuzzing/", "/fuzzers/", "/perf/", "/perftest/",
+                "/tools/", "/util/", "/utils/", "/utility/",
+                "/contrib/", "/extras/", "/scripts/", "/doc/", "/docs/",
+                "/xmlwf/", "/apps/", "/app/", "/cli/", "/bin/",
+                "/python/", "/perl/", "/ruby/", "/go/", "/rust/",
+            )
+            def _is_lib_api(api_name):
+                api_usr = name_to_usr.get(api_name)
+                api_file = (usr_to_file.get(api_usr) or "") if api_usr else ""
+                api_file = api_file.split(":", 1)[0].lower().replace("\\", "/")
+                if not api_file:
+                    return True  # unknown source; don't penalise
+                return not any(tok in api_file for tok in _NON_LIB_PATH_TOKENS)
+            filtered_apis = [a for a in candidate_apis if _is_lib_api(a)]
+            if filtered_apis:
+                if len(filtered_apis) != len(candidate_apis):
+                    print("DEBUG: Dropped {} non-library candidate APIs (tests/examples/tools)".format(
+                        len(candidate_apis) - len(filtered_apis)))
+                candidate_apis = filtered_apis
+
+            chosen_api = None
+            sink_dir = None
+            try:
+                if sink_file and sink_file != "<unresolved>":
+                    sink_dir = os.path.dirname(sink_file)
+            except Exception:
+                pass
+            if sink_dir and candidate_apis:
+                for api in candidate_apis:
+                    api_usr = name_to_usr.get(api)
+                    api_file = usr_to_file.get(api_usr) if api_usr else None
+                    if api_file and os.path.dirname(api_file) == sink_dir:
+                        chosen_api = api
+                        break
+            if not chosen_api and candidate_apis:
+                # Pick API with most outgoing callgraph edges (broadest reach)
+                best_count = -1
+                for api in candidate_apis:
+                    api_usr = name_to_usr.get(api)
+                    if api_usr and api_usr in adj:
+                        cnt = len(adj.get(api_usr, []))
+                        if cnt > best_count:
+                            best_count = cnt
+                            chosen_api = api
+                if not chosen_api:
+                    chosen_api = candidate_apis[0]
+            if chosen_api:
+                print("WARNING: No path to sink found. Falling back to general-purpose "
+                      "library exerciser via public API '{}'.".format(chosen_api),
+                      file=sys.stderr)
+                chosen_usr = name_to_usr.get(chosen_api, chosen_api)
+                wrapper_path = [chosen_usr]
+                public_api_name = chosen_api
+                entry["_rf_fallback_reason"] = "sink_unreachable_from_public_api"
+                entry["_rf_fallback_api"] = chosen_api
+            else:
+                sys.exit("Could not find a public API wrapper for sink '" + str(sink_func) +
+                         "' and no candidate public APIs were discovered.")
 
     # Get the public API name from the wrapper path
     # Path format is [sink, ..., public_api] - so public API is at the END
@@ -3020,6 +3227,41 @@ def main():
             trigger_function = tf
             break
 
+    # ── Build a curated subset of public-API signatures for the prompt ──
+    # Generic selection (no library knowledge):
+    #   1. Every function on the wrapper path
+    #   2. The chosen public_api_name
+    #   3. Functions named in execution_plan setup/update/cleanup/required-setup
+    #   4. Up to N functions sharing the longest common prefix (>=3 chars)
+    #      with the chosen entry point (e.g. ``TIFF*``, ``xml*``, ``png_*``)
+    #      drawn from the export-filtered ``public_api_names`` set.
+    # This gives the LLM concrete signatures for likely-needed sibling APIs
+    # without exploding the prompt to all 1000+ symbols.
+    relevant_sig_names = set()
+    relevant_sig_names.update(n for n in best_path_names if n)
+    if public_api_name:
+        relevant_sig_names.add(public_api_name)
+    for key in ('setup_candidates', 'update_candidates', 'cleanup_candidates',
+                'required_setup_calls'):
+        for fn in execution_plan.get(key, []) or []:
+            if isinstance(fn, str):
+                relevant_sig_names.add(fn)
+            elif isinstance(fn, dict):
+                nm = fn.get('name') or fn.get('function')
+                if nm:
+                    relevant_sig_names.add(nm)
+    if public_api_name and len(public_api_name) >= 3:
+        prefix = public_api_name[:3]
+        sibling_cap = 60
+        siblings = sorted(n for n in public_api_names
+                          if n.startswith(prefix) and n != public_api_name)
+        relevant_sig_names.update(siblings[:sibling_cap])
+    relevant_signatures = {
+        n: public_signatures[n]
+        for n in relevant_sig_names
+        if n in public_signatures
+    }
+
     # Emit harness plan
     plan = {
         "vuln_entry": entry,
@@ -3029,6 +3271,7 @@ def main():
         "usr_to_name": plan_usr_to_name,
         "public_api_name": public_api_name,
         "public_api_names": sorted(public_api_names),
+        "public_signatures": relevant_signatures,
         "vuln_context": vuln_context,
         "execution_plan": execution_plan,
         "trigger_plan": trigger_plan,

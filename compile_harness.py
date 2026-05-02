@@ -63,9 +63,201 @@ def extract_include_paths(commands):
     return include_paths
 
 
+def discover_project_search_paths(project_root, search_root='/src',
+                                  max_dirs_per_kind=120):
+    """Walk the source tree and return (include_dirs, library_dirs, library_names).
+
+    This is generic — no library-specific knowledge. It enables harness
+    compilation for projects that build via OSS-Fuzz ``build.sh`` (where we
+    don't have a captured compile-command log) and for projects whose build
+    leaves dependencies (e.g. a vendored zlib's ``libz.a``) in non-standard
+    paths.
+
+    - ``include_dirs``: every directory that contains at least one ``*.h``
+      file under ``search_root``. We skip obviously irrelevant trees
+      (``.git``, build-temp dirs, test fixtures).
+    - ``library_dirs``: every directory containing a ``lib*.a`` or
+      ``lib*.so[.*]`` artefact under ``search_root``.
+    - ``library_names``: the de-duplicated set of library base-names
+      (e.g. ``z``, ``jpeg``, ``zstd``) corresponding to those artefacts,
+      suitable for use as ``-l<name>`` flags. The caller chooses whether
+      to append them to the link line; including them is always safe
+      because the matching ``-L`` dir is also returned.
+
+    Results are de-duplicated and capped at ``max_dirs_per_kind`` to keep
+    the generated command line bounded.
+    """
+    if not search_root or not os.path.isdir(search_root):
+        # Fall back to project_root's grandparent if /src is missing
+        search_root = os.path.dirname(os.path.abspath(str(project_root)))
+        if not os.path.isdir(search_root):
+            return [], [], []
+
+    include_dirs = []
+    library_dirs = []
+    library_names = []
+    inc_seen = set()
+    lib_seen = set()
+    name_seen = set()
+    skip_dirnames = {'.git', '.svn', '.hg', '__pycache__', 'CMakeFiles',
+                     'node_modules', 'tests', 'test', 'testsuite',
+                     'fuzz', 'fuzzing', 'benchmark', 'benchmarks',
+                     'doc', 'docs', 'examples', 'example',
+                     # Project-internal headers (e.g. libxml2's
+                     # ``include/private/`` declares symbols with macros
+                     # like XML_HIDDEN that are only defined when building
+                     # the library itself, so adding them as -I breaks
+                     # external harness compilation).
+                     'private', 'internal',
+                     # OSS-Fuzz fuzzing-engine source trees in /src/.
+                     # Their build artefacts (libcentipede_runner.a,
+                     # libcentipede_runner.pic.a, etc.) are not real
+                     # link-time deps for harnesses.
+                     'aflplusplus', 'honggfuzz', 'libfuzzer', 'centipede',
+                     'AFLplusplus', 'fuzztest', 'bazel-bin', 'bazel-out',
+                     # The ReachForge source tree itself is bind-mounted
+                     # into the OSS-Fuzz container at /src/reachforge.
+                     # Walking it pulls in unrelated header trees from
+                     # oss-fuzz/projects/* which then poison -I and
+                     # cause cross-project header conflicts.
+                     'reachforge'}
+    # Library base-names belonging to fuzzing-engine internals; we never
+    # want to auto-add these as -l<name>.
+    fuzz_engine_libs = {'centipede_runner', 'dislocator', 'tokencap',
+                        'compcov', 'FuzzingEngine', 'afl', 'hfuzz',
+                        'honggfuzz', 'AFLDriver', 'qasan'}
+
+    for dirpath, dirnames, filenames in os.walk(search_root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirnames
+                       and not d.startswith('.')]
+        has_header = False
+        local_lib_names = []
+        for fn in filenames:
+            if not has_header and fn.endswith('.h'):
+                has_header = True
+            if fn.startswith('lib') and (fn.endswith('.a')
+                                         or '.so' in fn):
+                # Extract base name: libfoo.a -> foo, libfoo.so.1.2 -> foo
+                base = fn[3:]
+                if base.endswith('.a'):
+                    name = base[:-2]
+                else:
+                    # split on '.so'
+                    idx = base.find('.so')
+                    name = base[:idx] if idx > 0 else None
+                if name and name not in name_seen:
+                    name_seen.add(name)
+                    # Match against fuzz-engine libs at the raw name and
+                    # at the dot-split base (libcentipede_runner.pic.a
+                    # → name='centipede_runner.pic', base='centipede_runner').
+                    base_name = name.split('.')[0]
+                    if (name in fuzz_engine_libs
+                            or base_name in fuzz_engine_libs):
+                        continue
+                    local_lib_names.append(name)
+        if has_header and dirpath not in inc_seen:
+            inc_seen.add(dirpath)
+            include_dirs.append(dirpath)
+        if local_lib_names and dirpath not in lib_seen:
+            lib_seen.add(dirpath)
+            library_dirs.append(dirpath)
+            library_names.extend(local_lib_names)
+
+    if len(include_dirs) > max_dirs_per_kind:
+        include_dirs = include_dirs[:max_dirs_per_kind]
+    if len(library_dirs) > max_dirs_per_kind:
+        library_dirs = library_dirs[:max_dirs_per_kind]
+    return include_dirs, library_dirs, library_names
+
+
+def extract_link_flags(commands):
+    """Extract -l linker flags from the build log's link commands.
+    
+    Scans captured build commands for link-stage invocations (those with -o
+    producing a non-.o output) and collects all -l flags.  This captures
+    the actual system and third-party library dependencies the project was
+    built with, avoiding the need for hard-coded lists.
+    
+    Returns a list of unique -l flags in order of first appearance.
+    """
+    flags = []
+    seen = set()
+    # A minimal set of system libs that are always safe to add
+    always_safe = {'-lm', '-pthread', '-lpthread'}
+    # Fuzzing-engine internal libs that may appear in OSS-Fuzz build
+    # commands (e.g. when the image's default $LIB_FUZZING_ENGINE leaks
+    # into project link lines). They are not real link-time deps for our
+    # libFuzzer harness, so we drop them. Keep this list in sync with
+    # ``discover_project_search_paths.fuzz_engine_libs``.
+    fuzz_engine_lflags = {
+        '-lcentipede_runner', '-ldislocator', '-ltokencap', '-lcompcov',
+        '-lFuzzingEngine', '-lafl', '-lhfuzz', '-lhonggfuzz',
+        '-lAFLDriver', '-lqasan',
+    }
+    
+    for cmd in reversed(commands):
+        argv = cmd.get('argv', [])
+        # Only look at link commands (have -o, output is not .o)
+        if '-o' not in argv:
+            continue
+        idx = argv.index('-o')
+        if idx + 1 >= len(argv):
+            continue
+        output = argv[idx + 1]
+        if output.endswith('.o'):
+            continue
+        
+        for arg in argv:
+            if arg in fuzz_engine_lflags:
+                continue
+            if arg.startswith('-l') and arg not in seen:
+                seen.add(arg)
+                flags.append(arg)
+            elif arg == '-pthread' and '-pthread' not in seen:
+                seen.add('-pthread')
+                flags.append('-pthread')
+    
+    # Ensure basic system libs are present even if not in build log
+    for flag in ['-lm', '-pthread']:
+        if flag not in seen:
+            flags.append(flag)
+    
+    return flags
+
+
 def _detect_extra_libs(static_lib_path, lib_name):
     """Probe a static library with nm and return extra -l flags for common
-    transitive dependencies whose symbols are undefined."""
+    transitive dependencies whose symbols are undefined.
+    
+    Uses two strategies:
+    1. pkg-config --libs (if available) for standard libraries
+    2. nm symbol prefix matching as fallback
+    """
+    extra = []
+    
+    # Strategy 1: try pkg-config for the library's transitive deps
+    try:
+        proc = subprocess.run(
+            ['pkg-config', '--libs-only-l', lib_name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+        )
+        if proc.returncode == 0:
+            pkg_flags = proc.stdout.decode('utf-8', errors='replace').strip().split()
+            for flag in pkg_flags:
+                flag = flag.strip()
+                # Skip the library itself (e.g. -lyaml when building libyaml)
+                if flag == '-l' + lib_name:
+                    continue
+                if flag.startswith('-l') and flag not in extra:
+                    extra.append(flag)
+                    print("DEBUG: pkg-config detected dependency: " + flag)
+            # Do not early-return: pkg-config may miss optional codec libs
+            # (e.g. libtiff's libjbig/lzma) depending on how it was generated.
+            # Fall through to nm-based detection to augment.
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # pkg-config not available — fall through to nm-based detection
+    
+    # Strategy 2: nm-based symbol prefix matching (fallback)
     # Map of symbol prefix -> (library flag, excluded lib_names)
     # excluded lib_names prevents adding -lz when we ARE zlib, etc.
     symbol_to_lib = [
@@ -76,11 +268,25 @@ def _detect_extra_libs(static_lib_path, lib_name):
         ('icui18n', '-licui18n', {'icui18n'}),
         ('SSL_',    '-lssl',   {'ssl', 'openssl'}),
         ('EVP_',    '-lcrypto', {'crypto', 'openssl'}),
-        ('deflate', '-lz',     {'z', 'zlib'}),
-        ('inflate', '-lz',     {'z', 'zlib'}),
-        ('compress', '-lz',    {'z', 'zlib'}),
+        ('deflateInit', '-lz',     {'z', 'zlib'}),
+        ('inflateInit', '-lz',     {'z', 'zlib'}),
+        ('gzopen',   '-lz',     {'z', 'zlib'}),
+        ('gzdopen',  '-lz',     {'z', 'zlib'}),
+        ('gzread',   '-lz',     {'z', 'zlib'}),
+        ('gzwrite',  '-lz',     {'z', 'zlib'}),
+        ('gzclose',  '-lz',     {'z', 'zlib'}),
+        (' compress\n', '-lz',    {'z', 'zlib'}),
+        ('jpeg_',    '-ljpeg',  {'jpeg', 'libjpeg'}),
+        ('png_',     '-lpng',   {'png', 'libpng'}),
+        ('jbg_',     '-ljbig',  {'jbig'}),
+        ('acl_get_',  '-lacl',  {'acl'}),
+        ('acl_set_',  '-lacl',  {'acl'}),
+        ('acl_create', '-lacl', {'acl'}),
+        ('LZ4_',     '-llz4',   {'lz4'}),
+        ('lzo1x_',   '-llzo2',  {'lzo2'}),
+        ('XML_Parse', '-lexpat', {'expat'}),
+        ('xmlReadDoc', '-lxml2', {'xml2', 'libxml2'}),
     ]
-    extra = []
     try:
         proc = subprocess.run(
             ['nm', '--undefined-only', static_lib_path],
@@ -93,12 +299,81 @@ def _detect_extra_libs(static_lib_path, lib_name):
         return extra
 
     for prefix, flag, excluded in symbol_to_lib:
-        if lib_name in excluded:
+        # Check exact match OR prefix match (e.g. lib_name='png16' should exclude for 'png')
+        if lib_name in excluded or any(lib_name.startswith(e) for e in excluded):
             continue
         if prefix in undef and flag not in extra:
-            extra.append(flag)
-            print("DEBUG: Auto-detected transitive dependency: " + flag)
+            # Verify the library actually exists on this system before adding
+            if _system_lib_exists(flag):
+                extra.append(flag)
+                print("DEBUG: Auto-detected transitive dependency: " + flag)
+            else:
+                print("DEBUG: Skipping " + flag + " (not found on system)")
     return extra
+
+
+def _system_lib_exists(flag):
+    """Check whether a -lfoo library is actually available on the system.
+    
+    Uses ldconfig -p to check the shared library cache, and also checks
+    common static lib paths. Returns True if found (or check failed).
+    """
+    if not flag.startswith('-l'):
+        return True
+    lib_name = flag[2:]  # strip -l prefix
+    # Check ldconfig cache for shared library
+    try:
+        proc = subprocess.run(
+            ['ldconfig', '-p'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+        )
+        if proc.returncode == 0:
+            cache = proc.stdout.decode('utf-8', errors='replace')
+            if 'lib' + lib_name + '.so' in cache or 'lib' + lib_name + '-' in cache:
+                return True
+    except Exception:
+        pass
+    # Check common static/shared lib search paths
+    search_paths = [
+        '/usr/lib', '/usr/local/lib', '/usr/lib/x86_64-linux-gnu',
+        '/usr/lib64', '/lib', '/lib/x86_64-linux-gnu',
+    ]
+    for d in search_paths:
+        if not os.path.isdir(d):
+            continue
+        for name in ('lib' + lib_name + '.so', 'lib' + lib_name + '.a',
+                     'lib' + lib_name + '.so.0'):
+            if os.path.exists(os.path.join(d, name)):
+                return True
+    # If we can't confirm, assume it doesn't exist (conservative)
+    print("DEBUG: Library " + flag + " not found in system paths - skipping")
+    return False
+
+
+def _run_link_with_fallback(argv, cwd):
+    """Run a link command. If it fails with 'undefined reference' errors,
+    retry once with --unresolved-symbols=ignore-all so the harness can
+    still link past optional codec/auxiliary code paths inside static
+    archives (e.g. libtiff's JBIG codec, libarchive's ACL handler).
+    Returns the final CompletedProcess.
+    """
+    p = subprocess.run(argv, cwd=cwd, stderr=subprocess.PIPE)
+    if p.stderr:
+        sys.stderr.buffer.write(p.stderr)
+    if p.returncode == 0:
+        return p
+    stderr_text = p.stderr.decode('utf-8', errors='replace') if p.stderr else ''
+    if 'undefined reference' not in stderr_text:
+        return p
+    if any(a.startswith('-Wl,--unresolved-symbols') for a in argv):
+        return p
+    print("DEBUG: retrying link with --unresolved-symbols=ignore-all "
+          "to bypass optional-codec transitive deps", file=sys.stderr)
+    retry = list(argv) + [
+        '-Wl,--unresolved-symbols=ignore-all',
+        '-Wl,--warn-unresolved-symbols',
+    ]
+    return subprocess.run(retry, cwd=cwd)
 
 
 def is_test_binary(output, argv):
@@ -244,7 +519,8 @@ def find_library_in_project(project_root):
     search_dirs = [
         project_root,                    # Project root
         os.path.join(project_root, '.libs'),  # libtool output
-        os.path.join(project_root, 'build'),  # CMake build dir
+        os.path.join(project_root, '_rf_build'),  # CMake build dir
+        os.path.join(project_root, 'build'),  # Fallback for other build dirs
     ]
     
     # Also recurse to find .libs directories deeper in the tree
@@ -256,7 +532,7 @@ def find_library_in_project(project_root):
                 dirs.clear()
                 continue
             basename = os.path.basename(root_d)
-            if basename == '.libs' or basename == 'build':
+            if basename in ('.libs', 'build', '_rf_build'):
                 if root_d not in search_dirs:
                     search_dirs.append(root_d)
     except OSError:
@@ -268,6 +544,10 @@ def find_library_in_project(project_root):
             
         for pattern in patterns:
             matches = glob.glob(os.path.join(search_dir, pattern))
+            # Also search one level deeper — many build systems put
+            # libraries in subdirectories (e.g. _rf_build/libtiff/libtiff.a)
+            if not matches:
+                matches = glob.glob(os.path.join(search_dir, '*', pattern))
             if matches:
                 # Prefer shorter names (main lib over aux lib)
                 matches.sort(key=lambda x: len(os.path.basename(x)))
@@ -283,7 +563,7 @@ def find_library_in_project(project_root):
                 
                 return {
                     'path': lib_path,
-                    'dir': search_dir,
+                    'dir': os.path.dirname(lib_path),
                     'name': name,
                     'type': 'static' if lib_path.endswith('.a') else 'shared'
                 }
@@ -363,7 +643,7 @@ def find_project_root(commands):
     for cmd in commands:
         cwd = cmd.get('cwd', '')
         # Look for build directory pattern
-        if os.path.basename(cwd) == 'build':
+        if os.path.basename(cwd) in ('build', '_rf_build'):
             return os.path.dirname(cwd)
     return None
 
@@ -376,9 +656,130 @@ def has_sanitizer_flags(argv):
     return False
 
 
+def _cxx_stdlib_flag():
+    """Return ``-stdlib=libc++`` when libstdc++ isn't `-l`-loadable on this
+    image but libc++ is. clang++ defaults to libstdc++ on Linux, but several
+    OSS-Fuzz Ubuntu 16.04 base images ship libc++ only — the implicit
+    -lstdc++ then fails with `cannot find -lstdc++`. Library-agnostic; only
+    activates when the filesystem indicates libc++ is the right choice.
+
+    For -l<name> to succeed, the linker needs the unversioned `lib<name>.so`
+    symlink (or `lib<name>.a`). A versioned `.so.6` alone (which is what
+    these legacy images ship for the runtime) is NOT discoverable via -l.
+    """
+    import os as _os
+    libcxx = any(_os.path.exists(p) for p in (
+        "/usr/local/lib/libc++.so", "/usr/local/lib/libc++.a",
+        "/usr/lib/libc++.so", "/usr/lib/x86_64-linux-gnu/libc++.so",
+    ))
+    # Only the unversioned `.so` (or `.a`) is a valid -l target.
+    libstdcxx_linkable = any(_os.path.exists(p) for p in (
+        "/usr/lib/x86_64-linux-gnu/libstdc++.so",
+        "/usr/lib/libstdc++.so",
+        "/usr/local/lib/libstdc++.so",
+        "/usr/lib/x86_64-linux-gnu/libstdc++.a",
+        "/usr/lib/libstdc++.a",
+    ))
+    if libcxx and not libstdcxx_linkable:
+        return "-stdlib=libc++"
+    return None
+
+
+def _cxx_runtime_link_args():
+    """Extra link args needed at the *end* of the harness link line when we
+    forced ``-stdlib=libc++`` but only the static archives are available.
+
+    On legacy OSS-Fuzz Ubuntu 16.04 base images, ``libc++.a`` and
+    ``libc++abi.a`` are present but the unversioned ``.so`` symlinks aren't,
+    so clang++'s implicit ``-lc++`` link silently picks up nothing and the
+    binary segfaults at exec time with ``undefined symbol: _ZTISt9type_info``
+    (i.e. ``std::type_info`` typeinfo from the C++ stdlib). Force-link the
+    static archives in a group so cross-archive typeinfo refs resolve.
+    Library-agnostic — only activates when libc++ is the right stdlib AND
+    the static archives are present.
+    """
+    import os as _os
+    if _cxx_stdlib_flag() != "-stdlib=libc++":
+        return []
+    extras = []
+    # Prefer the *shared* libc++abi when available: legacy clang's
+    # libclang_rt.asan_cxx pulls in plain undefined refs to std typeinfo
+    # (`_ZTISt9type_info`, `_ZTISt8bad_cast`, ...) and links them with
+    # default visibility, expecting dynamic resolution. libc++abi.a's
+    # typeinfo objects carry hidden visibility in some images; whole-
+    # archiving them puts the symbols in the binary as `LOCAL HIDDEN`,
+    # which the dynamic linker can't see — so the program aborts at
+    # exec with `undefined symbol: _ZTISt8bad_cast`. The shared
+    # libc++abi.so.1 exposes them as global default-visibility, so the
+    # dynamic linker resolves them at runtime.
+    abi_so_dirs = []
+    abi_so = None
+    for d in ("/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu"):
+        cand = _os.path.join(d, "libc++abi.so")
+        cand_v = _os.path.join(d, "libc++abi.so.1")
+        if _os.path.exists(cand) or _os.path.exists(cand_v):
+            abi_so = cand if _os.path.exists(cand) else cand_v
+            abi_so_dirs.append(d)
+            break
+    if abi_so:
+        # `-l:libc++abi.so.1` works even when the unversioned `.so` symlink
+        # is missing; absolute path is the most robust.
+        extras.extend([
+            "-Wl,--no-as-needed", abi_so, "-Wl,--as-needed",
+            "-Wl,-rpath," + abi_so_dirs[0],
+        ])
+        return extras
+    # Fall back to static libc++abi.a + libc++.a with --whole-archive.
+    # On images where libc++abi was built with default visibility this
+    # path also works (zlib, json-c style images).
+    cxx_a = next((p for p in (
+        "/usr/local/lib/libc++.a", "/usr/lib/libc++.a") if _os.path.exists(p)), None)
+    abi_a = next((p for p in (
+        "/usr/local/lib/libc++abi.a", "/usr/lib/libc++abi.a") if _os.path.exists(p)), None)
+    if abi_a:
+        extras.extend(["-Wl,--whole-archive", abi_a, "-Wl,--no-whole-archive"])
+    if cxx_a:
+        extras.append(cxx_a)
+    if abi_a and cxx_a:
+        extras.append("-Wl,--allow-multiple-definition")
+    return extras
+
+
+def _primary_sanitizer_flag():
+    """The combined ``-fsanitize=...`` flag used by every compile site.
+
+    Mirrors build_capture's choice via ``RF_SANITIZER_MODE`` (set to
+    ``asan_only`` when the library build had to fall back from ASan+UBSan
+    on legacy clang/libc++ toolchains where UBSan can't link). Mismatched
+    sanitizer modes between the library and the harness fail to link, so
+    every harness compile must match.
+    """
+    import os as _os
+    if _os.environ.get("RF_SANITIZER_MODE") == "asan_only":
+        return '-fsanitize=address,fuzzer'
+    # Sentinel-file fallback (env may not propagate to every child process):
+    for cand in ("rf_sanitizer_mode", "../rf_sanitizer_mode",
+                 "/out/rf_sanitizer_mode"):
+        try:
+            from pathlib import Path as _P
+            p = _P(cand)
+            if p.exists() and p.read_text().strip() == "asan_only":
+                return '-fsanitize=address,fuzzer'
+        except Exception:
+            pass
+    # Implicit asan-only when libstdc++ is missing: UBSan's compiler-rt
+    # references libstdc++'s typeinfo for std::bad_cast / std::type_info.
+    # `-stdlib=libc++` lets the binary compile but it fails at runtime with
+    # `undefined symbol: _ZTISt8bad_cast`. The same filesystem probe we use
+    # to decide on `-stdlib=libc++` decides this. No library-specific code.
+    if _cxx_stdlib_flag() == "-stdlib=libc++":
+        return '-fsanitize=address,fuzzer'
+    return '-fsanitize=address,undefined,fuzzer'
+
+
 def add_sanitizer_flags(argv):
     """Add ASAN/UBSAN and fuzzer flags to the command."""
-    sanitizer_flags = ['-fsanitize=address,undefined,fuzzer']
+    sanitizer_flags = [_primary_sanitizer_flag(), '-fno-sanitize-recover=all']
     asan_compile_flags = [
         '-fno-omit-frame-pointer',
         '-fno-optimize-sibling-calls',
@@ -420,31 +821,44 @@ def compile_harness_direct(harness_src, commands, out_binary, project_root):
     # Extract all include paths from build commands
     # This is essential for generated headers like zconf.h (zlib), pnglibconf.h (libpng)
     include_paths = extract_include_paths(commands)
+    # Also add the cwd of compile commands — headers may be in the same
+    # directory as the source files (e.g. lz4 builds from lib/).
+    for cmd in commands:
+        cwd = cmd.get('cwd', '')
+        if cwd and cwd not in include_paths and os.path.isdir(cwd):
+            include_paths.append(cwd)
     print("DEBUG: Extracted include paths: " + str(include_paths))
     
     compiler = 'clang++'
     
     # Build the compile command
-    new_argv = [
+    new_argv = [a for a in [
         compiler,
-        '-fsanitize=address,undefined,fuzzer',
+        _cxx_stdlib_flag(),
+        _primary_sanitizer_flag(),
+        '-fno-sanitize-recover=all',
         '-fno-omit-frame-pointer',
         '-gline-tables-only',
         '-I' + str(project_root),
+        '-I' + str(os.path.dirname(str(project_root))),
         '-o', out_binary,
         harness_src,
-    ]
-    
+    ] if a is not None]
+
     # Add all extracted include paths (for generated headers like zconf.h)
     for inc_path in include_paths:
         inc_flag = '-I' + str(inc_path)
         if inc_flag not in new_argv:
             new_argv.insert(4, inc_flag)
     
-    # Add defines from library compile
+    # Forward macro definitions from library compile commands.
+    # These may include build-time configuration macros that library headers
+    # depend on (e.g., HAVE_CONFIG_H, _LARGEFILE_SOURCE, feature toggles).
+    _forwarded_defines = set()
     if lib_cmd:
         for arg in lib_cmd['argv']:
-            if arg.startswith('-D') and ('EXPORT' in arg or 'ENABLE' in arg or 'VISIBILITY' in arg):
+            if arg.startswith('-D') and arg not in _forwarded_defines:
+                _forwarded_defines.add(arg)
                 new_argv.insert(4, arg)
     
     # Try to find a library to link against
@@ -498,10 +912,18 @@ def compile_harness_direct(harness_src, commands, out_binary, project_root):
     if not lib_linked:
         print("WARNING: No library object files, static library, or project library found")
     
-    new_argv.extend(['-lm', '-pthread'])
-    
-    print("Compiling harness: " + " ".join(shlex.quote(a) for a in new_argv))
-    p = subprocess.run(new_argv, cwd=project_root)
+    # Extract linker flags from build log (captures actual -l deps);
+    # falls back to -lm -pthread if no link command was recorded.
+    link_flags = extract_link_flags(commands)
+    new_argv.append('-Wl,--start-group')
+    new_argv.extend(link_flags)
+    new_argv.append('-Wl,--end-group')
+    new_argv.extend(_cxx_runtime_link_args())
+
+    cmd_str = " ".join(shlex.quote(a) for a in new_argv)
+    print("Compiling harness: " + cmd_str)
+    print("Compiling harness: " + cmd_str, file=sys.stderr)
+    p = _run_link_with_fallback(new_argv, project_root)
     
     output_path = os.path.join(project_root, out_binary)
     if p.returncode != 0:
@@ -512,6 +934,15 @@ def compile_harness_direct(harness_src, commands, out_binary, project_root):
         else:
             sys.exit("Harness binary not found at " + str(output_path))
     print("Harness binary created: " + str(output_path))
+    try:
+        _emit_fuzzer_options(
+            os.path.dirname(str(output_path)),
+            str(output_path),
+            os.path.join(os.path.dirname(str(output_path)),
+                         "harness_plan.json"),
+        )
+    except Exception:
+        pass
     return output_path
 
 
@@ -533,44 +964,96 @@ def compile_harness_with_project_lib(harness_src, project_lib, out_binary, proje
     include_paths = []
     if commands:
         include_paths = extract_include_paths(commands)
+        for cmd in commands:
+            cwd = cmd.get('cwd', '')
+            if cwd and cwd not in include_paths and os.path.isdir(cwd):
+                include_paths.append(cwd)
         print("DEBUG: Extracted include paths: " + str(include_paths))
+
+    # Augment with directories discovered from the source tree. This is
+    # essential for OSS-Fuzz build.sh paths where we have no captured
+    # compile-command log, and also catches vendored deps (e.g. a libtiff
+    # build that produces /src/zlib/libz.a in a non-default location).
+    discovered_includes, discovered_libdirs, discovered_libnames = \
+        discover_project_search_paths(project_root)
+    for inc in discovered_includes:
+        if inc not in include_paths:
+            include_paths.append(inc)
+    if discovered_libdirs:
+        print("DEBUG: Discovered library dirs: {} entries".format(
+            len(discovered_libdirs)))
+    # Compute candidate transitive deps from artefact names. Skip the
+    # project's own library (linked by direct path) and the system libs
+    # we already add unconditionally.
+    skip_link_names = {lib_name, 'm', 'pthread', 'dl', 'rt', 'c', 'gcc',
+                       'gcc_s', 'stdc++'}
+    discovered_link_flags = []
+    for n in discovered_libnames:
+        if n in skip_link_names:
+            continue
+        # Strip common version suffixes left over from libfoo.so.0 -> foo.0
+        base = n.split('.')[0]
+        if base in skip_link_names or not base:
+            continue
+        flag = '-l' + base
+        if flag not in discovered_link_flags:
+            discovered_link_flags.append(flag)
     
     if project_lib['type'] == 'static':
         # Static library - link directly
-        new_argv = [
+        new_argv = [a for a in [
             compiler,
-            '-fsanitize=address,undefined,fuzzer',
+            _cxx_stdlib_flag(),
+            _primary_sanitizer_flag(),
+            '-fno-sanitize-recover=all',
             '-fno-omit-frame-pointer',
             '-gline-tables-only',
             '-I' + str(project_root),
+            '-I' + str(os.path.dirname(str(project_root))),
             '-o', out_binary,
             harness_src,
-        ]
-        
+        ] if a is not None]
+
         # Add extracted include paths (for generated headers like zconf.h)
         for inc_path in include_paths:
             inc_flag = '-I' + str(inc_path)
             if inc_flag not in new_argv:
                 new_argv.insert(4, inc_flag)
         
+        extra_libs = _detect_extra_libs(lib_path, lib_name)
+        new_argv.append('-Wl,--start-group')
         new_argv.extend([lib_path, '-lm', '-pthread'])
-        
-        # Auto-detect additional transitive dependencies (e.g. -llzma, -lbz2, -lz)
-        new_argv.extend(_detect_extra_libs(lib_path, lib_name))
-        
+        # Discovered -L paths (for vendored deps like zlib built under /src/<dep>)
+        for ld in discovered_libdirs:
+            l_flag = '-L' + str(ld)
+            if l_flag not in new_argv:
+                new_argv.append(l_flag)
+        # Discovered -l flags from artefact names. Their availability is
+        # guaranteed because the matching -L dir is already on the line,
+        # so we don't run them through the system-lib existence check.
+        for lflag in discovered_link_flags:
+            if lflag not in new_argv:
+                new_argv.append(lflag)
+        new_argv.extend(extra_libs)
+        new_argv.append('-Wl,--end-group')
+        new_argv.extend(_cxx_runtime_link_args())
+
         print("Linking with static library: " + str(lib_path))
     else:
         # Shared library - use -L and -l with rpath
-        new_argv = [
+        new_argv = [a for a in [
             compiler,
-            '-fsanitize=address,undefined,fuzzer',
+            _cxx_stdlib_flag(),
+            _primary_sanitizer_flag(),
+            '-fno-sanitize-recover=all',
             '-fno-omit-frame-pointer',
             '-gline-tables-only',
             '-I' + str(project_root),
+            '-I' + str(os.path.dirname(str(project_root))),
             '-o', out_binary,
             harness_src,
-        ]
-        
+        ] if a is not None]
+
         # Add extracted include paths (for generated headers like zconf.h)
         for inc_path in include_paths:
             inc_flag = '-I' + str(inc_path)
@@ -584,11 +1067,21 @@ def compile_harness_with_project_lib(harness_src, project_lib, out_binary, proje
             '-lm',
             '-pthread',
         ])
+        # Discovered -L paths (vendored deps)
+        for ld in discovered_libdirs:
+            l_flag = '-L' + str(ld)
+            if l_flag not in new_argv:
+                new_argv.append(l_flag)
+        # Discovered -l flags from vendored-dep artefacts
+        for lflag in discovered_link_flags:
+            if lflag not in new_argv:
+                new_argv.append(lflag)
         print("Linking with shared library: -L" + str(lib_dir) + " -l" + str(lib_name))
     
     cmd_str = " ".join(shlex.quote(a) for a in new_argv)
     print("Compiling harness: " + cmd_str)
-    p = subprocess.run(new_argv, cwd=project_root)
+    print("Compiling harness: " + cmd_str, file=sys.stderr)
+    p = _run_link_with_fallback(new_argv, project_root)
     
     output_path = os.path.join(project_root, out_binary)
     if p.returncode != 0:
@@ -608,6 +1101,27 @@ def compile_harness_with_shared_lib(harness_src, shared_lib_info, out_binary, pr
     lib_path = os.path.join(shared_lib_info['cwd'], shared_lib_info['path'])
     lib_dir = os.path.dirname(lib_path)
     lib_name = shared_lib_info['name']
+    lib_cwd = shared_lib_info.get('cwd', '')
+
+    # Collect additional include directories: the directory where the lib
+    # was built often contains the public headers (e.g. lz4 builds in lib/).
+    extra_includes = []
+    for d in [lib_cwd, lib_dir]:
+        if d and d != str(project_root) and os.path.isdir(d):
+            extra_includes.append('-I' + d)
+    # Augment with all header-bearing directories under the source tree.
+    # Necessary for projects whose public headers (e.g. libarchive's
+    # ``archive.h`` in ``libarchive/``) are not in any standard
+    # ``include/`` dir relative to the .so build location.
+    try:
+        _disc_inc, _disc_libdirs, _disc_libnames = \
+            discover_project_search_paths(project_root)
+    except Exception:
+        _disc_inc, _disc_libdirs, _disc_libnames = [], [], []
+    for inc in _disc_inc:
+        flag = '-I' + inc
+        if flag not in extra_includes:
+            extra_includes.append(flag)
     
     # Also check for .libs subdirectory (libtool style)
     libs_dir = os.path.join(shared_lib_info['cwd'], '.libs')
@@ -653,33 +1167,39 @@ def compile_harness_with_shared_lib(harness_src, shared_lib_info, out_binary, pr
     
     if os.path.exists(static_lib):
         print("DEBUG: Using static library: " + str(static_lib))
-        new_argv = [
+        new_argv = [a for a in [
             compiler,
-            '-fsanitize=address,undefined,fuzzer',
+            _cxx_stdlib_flag(),
+            _primary_sanitizer_flag(),
+            '-fno-sanitize-recover=all',
             '-fno-omit-frame-pointer',
             '-gline-tables-only',
             '-I' + str(project_root),
+            '-I' + str(os.path.dirname(str(project_root))),
             '-o', out_binary,
             harness_src,
-            static_lib,
-            '-lm',
-            '-pthread',
-        ]
-        
+        ] if a is not None]
+
         # Auto-detect additional transitive dependencies (e.g. -llzma, -lbz2, -lz)
-        new_argv.extend(_detect_extra_libs(static_lib, lib_name))
-        
-        new_argv.append('-ldl')
+        extra_libs = _detect_extra_libs(static_lib, lib_name)
+        new_argv.append('-Wl,--start-group')
+        new_argv.extend([static_lib, '-lm', '-pthread'])
+        new_argv.extend(extra_libs)
+        new_argv.extend(['-ldl', '-Wl,--end-group'])
+        new_argv.extend(_cxx_runtime_link_args())
     elif actual_lib_path:
         print("DEBUG: Using shared library: " + str(actual_lib_path))
         
         # Link directly with the .so file - always use --no-as-needed for shared libs
-        new_argv = [
+        new_argv = [a for a in [
             compiler,
-            '-fsanitize=address,undefined,fuzzer',
+            _cxx_stdlib_flag(),
+            _primary_sanitizer_flag(),
+            '-fno-sanitize-recover=all',
             '-fno-omit-frame-pointer',
             '-gline-tables-only',
             '-I' + str(project_root),
+            '-I' + str(os.path.dirname(str(project_root))),
             '-o', out_binary,
             harness_src,
             '-Wl,--no-as-needed',
@@ -689,16 +1209,20 @@ def compile_harness_with_shared_lib(harness_src, shared_lib_info, out_binary, pr
             '-lm',
             '-pthread',
             '-ldl',  # zlib often needed
-        ]
+        ] if a is not None]
+        new_argv.extend(_cxx_runtime_link_args())
     else:
         # Fallback to standard -l linking
         print("DEBUG: Using fallback -l linking")
-        new_argv = [
+        new_argv = [a for a in [
             compiler,
-            '-fsanitize=address,undefined,fuzzer',
+            _cxx_stdlib_flag(),
+            _primary_sanitizer_flag(),
+            '-fno-sanitize-recover=all',
             '-fno-omit-frame-pointer',
             '-gline-tables-only',
             '-I' + str(project_root),
+            '-I' + str(os.path.dirname(str(project_root))),
             '-o', out_binary,
             harness_src,
             '-Wl,--no-as-needed',
@@ -709,13 +1233,19 @@ def compile_harness_with_shared_lib(harness_src, shared_lib_info, out_binary, pr
             '-lm',
             '-pthread',
             '-ldl',
-        ]
-    
+        ] if a is not None]
+        new_argv.extend(_cxx_runtime_link_args())
+
     # Also try linking with static library if available
     static_lib = os.path.join(lib_dir, 'lib' + lib_name + '.a')
     if os.path.exists(static_lib):
         print("Also found static library: " + str(static_lib))
-    
+
+    # Insert additional include paths (e.g. lib/ subdirectory where headers live)
+    for inc in extra_includes:
+        if inc not in new_argv:
+            new_argv.insert(4, inc)
+
     cwd = shared_lib_info['cwd']
     
     # Print the full command to stderr so it's visible even when stdout is captured
@@ -797,11 +1327,17 @@ def compile_harness(plan, harness_src, commands_log, out_binary):
     
     # Add include path
     include_flag = '-I' + str(project_root)
+    parent_include_flag = '-I' + str(os.path.dirname(str(project_root)))
     if include_flag not in new_argv:
         for i, arg in enumerate(new_argv):
             if arg.endswith('clang++') or arg.endswith('g++') or arg.endswith('c++') or \
                arg.endswith('clang') or arg.endswith('gcc'):
                 new_argv.insert(i + 1, include_flag)
+                break
+    if parent_include_flag not in new_argv:
+        for i, arg in enumerate(new_argv):
+            if arg == include_flag:
+                new_argv.insert(i + 1, parent_include_flag)
                 break
     
     # Add sanitizer flags
@@ -816,8 +1352,10 @@ def compile_harness(plan, harness_src, commands_log, out_binary):
         new_argv.append(lib_fuzzing_engine)
         print("Linking with LIB_FUZZING_ENGINE: " + str(lib_fuzzing_engine))
     
-    print("Compiling harness: " + " ".join(shlex.quote(a) for a in new_argv))
-    p = subprocess.run(new_argv, cwd=cwd)
+    cmd_str_b = " ".join(shlex.quote(a) for a in new_argv)
+    print("Compiling harness: " + cmd_str_b)
+    print("Compiling harness: " + cmd_str_b, file=sys.stderr)
+    p = _run_link_with_fallback(new_argv, cwd)
     output_path = os.path.join(cwd, out_binary)
     if p.returncode != 0:
         sys.exit("Harness compile failed (rc=" + str(p.returncode) + ")")
@@ -827,6 +1365,47 @@ def compile_harness(plan, harness_src, commands_log, out_binary):
         else:
             sys.exit("Harness binary not found at " + str(output_path))
     print("Harness binary created: " + str(output_path))
+
+
+def _emit_fuzzer_options(out_dir, binary_path, plan_path):
+    """Emit a libFuzzer `<binary>.options` file with `max_len` keyed on the
+    CVE's CWE class. libFuzzer reads this automatically when the binary
+    is invoked. Without it, libFuzzer caps inputs at 4 KB which is too
+    small for size-driven (CWE-190) and resource-exhaustion (CWE-770/674)
+    CVEs to ever reach the trigger.
+
+    Library-agnostic; CWE-driven only.
+    """
+    try:
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except Exception:
+        plan = {}
+    entry = plan.get("vuln_entry", {}) if isinstance(plan, dict) else {}
+    raw = entry.get("cwe-id") or entry.get("cwe") or []
+    if isinstance(raw, str):
+        cwes = {c.strip().upper() for c in raw.replace(",", " ").split()
+                if c.strip()}
+    elif isinstance(raw, list):
+        cwes = {str(c).strip().upper() for c in raw if str(c).strip()}
+    else:
+        cwes = set()
+    # Default 64 KB; bump for size-driven / exhaustion CVEs that need MB+
+    # inputs; bump further for INT_MAX-reaching size overflows.
+    max_len = 65536
+    if cwes & {"CWE-190", "CWE-191"}:
+        max_len = 1 << 20            # 1 MB
+    if cwes & {"CWE-770", "CWE-789", "CWE-674", "CWE-121", "CWE-122"}:
+        max_len = max(max_len, 1 << 20)
+    options_path = Path(binary_path).with_suffix(
+        Path(binary_path).suffix + ".options"
+    ) if Path(binary_path).suffix else Path(str(binary_path) + ".options")
+    body = "[libfuzzer]\nmax_len = {}\ntimeout = 25\n".format(max_len)
+    try:
+        options_path.write_text(body)
+        print("Wrote fuzzer options: " + str(options_path) +
+              " (max_len=" + str(max_len) + ")")
+    except Exception as _e:
+        pass
 
 
 def main():

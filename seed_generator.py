@@ -6,6 +6,7 @@ Uses: vulnerabilities.json, harness_plan.json, generated harness, and source cod
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +92,234 @@ def _cap_text(text, limit=2000):
     return text[:limit] + "\n... [truncated]"
 
 
+# Generic CWE-class -> boundary-value hint table.
+# Hints are numeric / structural only; no library or CVE-specific syntax.
+_CWE_HINT_TABLE = {
+    # Buffer overflow / out-of-bounds write (heap, stack, generic)
+    "CWE-787": [
+        "Test length fields at boundaries: 0, 1, 127, 128, 255, 256, 257, "
+        "511, 512, 1023, 1024, 4095, 4096, 65535, 65536, 65537, 2^31-1, 2^32-1.",
+        "Mismatch declared-length vs actual payload length (declare N, send <N or >N bytes).",
+        "Truncate the input mid-record so a length-prefixed copy reads past EOF.",
+    ],
+    "CWE-121": [
+        "Probe stack-allocated buffer sizes with payloads of 64, 128, 256, "
+        "512, 1024, 2048, 4096, 8192 bytes plus +/-1 around each.",
+        "Send oversize identifiers, names, or path components that the parser "
+        "may copy into a fixed-size on-stack buffer.",
+    ],
+    "CWE-122": [
+        "Vary heap-allocated capacity vs payload length around 256, 1024, "
+        "4096, 65536 bytes (alloc N, append N+k for k in {1,2,16,256}).",
+        "Send inputs whose total size approaches and exceeds the first "
+        "realloc threshold of typical dynamic buffers.",
+    ],
+    "CWE-125": [
+        "Truncate the input at every record boundary; the parser may read "
+        "past EOF when it expects a continuation.",
+        "Set declared-length fields larger than the actual byte stream.",
+        "Provide zero-length or one-byte trailing chunks where the parser "
+        "expects a fixed-size header.",
+    ],
+    "CWE-119": [
+        "Combine the CWE-787 and CWE-125 sweeps: oversized length fields, "
+        "truncated payloads, and length/payload mismatches.",
+    ],
+    "CWE-680": [
+        "Drive a length or count toward 2^31-1 / 2^32-1 so that the "
+        "subsequent allocation size wraps to a small value before the copy.",
+    ],
+    # Integer overflow / underflow
+    "CWE-190": [
+        "Sweep integer fields through signed/unsigned boundaries: -1, 0, 1, "
+        "127, 128, 255, 256, 32767, 32768, 65535, 65536, 2^31-2, 2^31-1, "
+        "2^31 (as unsigned), 2^32-1.",
+        "Multiply two large length fields (e.g. width*height, count*item_size) "
+        "so their product overflows 32-bit while each factor remains plausible.",
+        "Send negative values where the parser expects non-negative counts.",
+    ],
+    "CWE-191": [
+        "Send zero or one in fields the parser will decrement before use; "
+        "negative results may underflow into huge unsigned values.",
+    ],
+    # Divide-by-zero / floating-point
+    "CWE-369": [
+        "Set divisor / stride / denominator fields to 0.",
+        "Set width, height, depth, or sample-count fields to 0 with non-zero "
+        "data following.",
+    ],
+    # Use-after-free / double-free
+    "CWE-416": [
+        "Trigger error / cleanup paths mid-parse: send a valid header followed "
+        "by malformed continuation so the parser frees state then continues.",
+        "Repeat the same record/identifier twice to exercise re-registration "
+        "paths that may free the prior copy.",
+    ],
+    "CWE-415": [
+        "Cause a parse error after partial allocation: e.g. valid begin, "
+        "valid mid-state, then malformed end — cleanup may free twice.",
+    ],
+    # Null pointer dereference
+    "CWE-476": [
+        "Omit optional sub-records that the parser may not check for NULL.",
+        "Truncate just before a required sub-field; later code paths may "
+        "still dereference the partially-initialized object.",
+        "Send empty / zero-length values where a non-empty pointer is "
+        "expected (empty string, empty array, zero-length blob).",
+    ],
+    # Recursion / resource exhaustion
+    "CWE-674": [
+        "Build deeply nested structures: 100, 1000, 5000, 10000, 50000 "
+        "levels of nesting. Exact syntax depends on the format the harness "
+        "parses (arrays/objects/elements) — infer from the harness source.",
+    ],
+    "CWE-776": [
+        "Construct billion-laughs / exponential-expansion inputs: many "
+        "entities/macros/aliases that each reference the previous, doubling "
+        "size at each level. 8-12 levels is usually enough.",
+    ],
+    "CWE-400": [
+        "Maximize total work per byte: deeply nested or repetitive structures "
+        "that force quadratic / exponential parsing time.",
+    ],
+    # XXE / external entity
+    "CWE-611": [
+        "Embed external-entity references that point to local resources.",
+        "Combine with deep nesting (CWE-776 style) to amplify.",
+    ],
+    # Injection / argument injection
+    "CWE-74": [
+        "Insert format / control characters: nul (\\x00), CR/LF, backslash, "
+        "quote, semicolon, ampersand, pipe, dollar-brace at every textual "
+        "field boundary.",
+    ],
+    "CWE-77": [
+        "Try shell-metacharacter sequences in textual fields: ; & | ` $() "
+        "and embedded newlines.",
+    ],
+    "CWE-78": [
+        "Try shell-metacharacter sequences in textual fields: ; & | ` $() "
+        "and embedded newlines.",
+    ],
+    "CWE-345": [
+        "Corrupt checksum / signature / length / magic fields by single-bit, "
+        "single-byte, and trailing-byte modifications.",
+        "Test off-by-one boundaries in any verification length field.",
+    ],
+    # Format string
+    "CWE-134": [
+        "Send %s, %n, %x, and long %s.%s sequences in any textual field "
+        "that may flow into printf-style formatters.",
+    ],
+}
+
+
+def _cwe_class_hints(cwe_id):
+    """Return a list of generic boundary-value hints for the given CWE ID, or []."""
+    if not cwe_id:
+        return []
+    # Normalize: accept "CWE-125", "cwe-125", "125".
+    s = cwe_id.upper().strip()
+    if s.isdigit():
+        s = "CWE-" + s
+    return list(_CWE_HINT_TABLE.get(s, []))
+
+
+# ---------------------------------------------------------------------------
+# Numeric-constant mining (generic; no library/CVE knowledge).
+#
+# Smoke-only failure mode: the harness reaches the sink, but seeds don't
+# satisfy the trigger predicate (often `len > N`, `count >= N`, `n == 0`
+# etc).  Mining the integer constants that the patch *changed* and the
+# constants the vulnerable function *compares against* gives the LLM
+# concrete sentinel values to target.  These overwhelmingly correspond
+# to the trigger predicate of the bug.
+# ---------------------------------------------------------------------------
+
+_NUM_LIT_RE = re.compile(r"\b(0[xX][0-9a-fA-F]+|[0-9]+)(?:[uUlL]+)?\b")
+
+
+def _mine_numeric_constants(text, max_constants=20, exclude=None):
+    """Extract interesting integer literals from C/C++ source or diff text.
+
+    Skips trivial values (0, 1, very small ints) since those carry no
+    trigger-condition signal.  Generic — no library knowledge.
+    """
+    if not text:
+        return []
+    excl = set(exclude or [])
+    seen = []
+    for m in _NUM_LIT_RE.finditer(text):
+        tok = m.group(1)
+        try:
+            if tok.lower().startswith("0x"):
+                val = int(tok, 16)
+            else:
+                val = int(tok)
+        except Exception:
+            continue
+        # Skip trivial / line-number-ish values.
+        if val < 16:
+            continue
+        # Skip absurdly large values (likely hashes/addresses).
+        if val > (1 << 48):
+            continue
+        if val in excl:
+            continue
+        # Normalize: hex form for >=256, decimal otherwise.
+        norm = hex(val) if val >= 256 else str(val)
+        if norm not in seen:
+            seen.append(norm)
+        if len(seen) >= max_constants:
+            break
+    return seen
+
+
+def _mine_diff_constants(diff_text, max_constants=15):
+    """Extract integer literals appearing on changed (+/-) lines of a diff.
+
+    These are constants the patch *touched* — almost always the bound
+    or sentinel involved in the bug.
+    """
+    if not diff_text:
+        return []
+    changed = []
+    for line in diff_text.splitlines():
+        if not line:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            changed.append(line[1:])
+    return _mine_numeric_constants("\n".join(changed), max_constants)
+
+
+def _seed_cwe_guidance(plan: dict) -> list:
+    """Mirror harness-side CWE guidance for the seed builder so seeds
+    don't clamp the values that drive the trigger."""
+    cwes = []
+    entry = plan.get("vuln_entry", {}) if isinstance(plan, dict) else {}
+    raw = entry.get("cwe-id") or entry.get("cwe") or []
+    if isinstance(raw, str):
+        cwes = [c.strip() for c in raw.replace(",", " ").split() if c.strip()]
+    elif isinstance(raw, list):
+        cwes = [str(c).strip() for c in raw if str(c).strip()]
+    cwes = {c.upper() for c in cwes}
+    out = []
+    if cwes & {"CWE-190", "CWE-191"}:
+        out.append("- For arithmetic-overflow CVEs, EMIT seeds that "
+                   "encode size/length values at INT_MAX, INT_MAX-1, "
+                   "INT_MAX-1024 directly. Do NOT clamp these values.")
+    if cwes & {"CWE-674", "CWE-770", "CWE-789", "CWE-121"}:
+        out.append("- For uncontrolled-recursion / resource-exhaustion "
+                   "CVEs, EMIT seeds whose depth/count/length values "
+                   "exceed the harness's runtime caps if any. Do NOT "
+                   "clamp depth in `make_seed_bytes()`.")
+    if not out:
+        return []
+    return ["", "## CWE-class seed guidance (mandatory):"] + out + [""]
+
+
 def build_seed_prompt(
     root,
     harness_plan_path,
@@ -137,10 +366,14 @@ def build_seed_prompt(
 
     # ---- Build the prompt ----
     lines = []
+    # CWE-class seed guidance (injected so the LLM does not clamp
+    # input-derived values that DRIVE the trigger for arithmetic
+    # overflow / recursion / OOM CVEs).
+    lines.extend(_seed_cwe_guidance(harness_plan))
     lines.append("# Seed Builder Script Generation")
     lines.append("")
     lines.append("Write a **self-contained Python 3 script** that programmatically")
-    lines.append("constructs 5-10 targeted seed inputs and writes them to `seeds.json`")
+    lines.append("constructs 15-30 targeted seed inputs and writes them to `seeds.json`")
     lines.append("in the current working directory.")
     lines.append("")
     lines.append("Study the fuzz harness and vulnerable function source below to determine")
@@ -184,6 +417,49 @@ def build_seed_prompt(
             lines.append("")
             for item in trigger_summary:
                 lines.append("- {}".format(item))
+            lines.append("")
+
+    # -- CWE-class boundary hints (generic; no library/CVE specifics) --
+    cwe_id = (vuln_entry.get('cwe-id') or '').upper().strip()
+    cwe_hints = _cwe_class_hints(cwe_id)
+    if cwe_hints:
+        lines.append("## Boundary-Value Hints for {}".format(cwe_id or 'this CWE class'))
+        lines.append("")
+        lines.append("Seeds that exercise these boundary regimes are most likely to "
+                     "trigger the fault. Generate inputs that span the listed values; "
+                     "do not stop at one — produce a sweep covering each bucket.")
+        lines.append("")
+        for h in cwe_hints:
+            lines.append("- {}".format(h))
+        lines.append("")
+
+    # -- Trigger-critical constants mined from the patch and the
+    # vulnerable function source (generic; purely syntactic). --
+    diff_consts = []
+    for d in patch_diffs:
+        diff_consts.extend(_mine_diff_constants(str(d)))
+    # Dedup preserving order.
+    seen_dc = set(); diff_consts = [c for c in diff_consts if not (c in seen_dc or seen_dc.add(c))]
+    src_consts = _mine_numeric_constants(vuln_source, max_constants=15,
+                                         exclude=set(diff_consts))
+    if diff_consts or src_consts:
+        lines.append("## Trigger-Critical Numeric Constants")
+        lines.append("")
+        lines.append("These integer literals are the bounds and sentinels that "
+                     "the bug depends on. Generate at least one seed whose "
+                     "controlling field equals each value below, plus one for "
+                     "value-1 and one for value+1. These are the highest-priority "
+                     "trigger candidates.")
+        lines.append("")
+        if diff_consts:
+            lines.append("**From the patch (most directly relevant):**")
+            lines.append("")
+            lines.append("`" + ", ".join(diff_consts[:15]) + "`")
+            lines.append("")
+        if src_consts:
+            lines.append("**From the vulnerable function (compared / asserted against):**")
+            lines.append("")
+            lines.append("`" + ", ".join(src_consts[:15]) + "`")
             lines.append("")
 
     # -- Trigger protocol --
@@ -287,7 +563,10 @@ def build_seed_prompt(
     lines.append("")
     lines.append("Write a Python 3 script that:")
     lines.append("1. Uses ONLY the standard library (`struct`, `zlib`, `base64`, `json`, `os`).")
-    lines.append("2. Constructs 5-10 seed inputs as raw `bytes` objects.")
+    lines.append("2. Constructs **15-30** seed inputs as raw `bytes` objects.")
+    lines.append("   Aim for at least one seed per boundary value listed in the")
+    lines.append("   **Trigger-Critical Numeric Constants** and **Boundary-Value Hints**")
+    lines.append("   sections above. Do not stop at a single example per regime.")
     lines.append("3. Each seed must be a structurally valid input that passes the target's")
     lines.append("   initial parsing (correct magic bytes, headers, checksums, framing, etc.).")
     lines.append("   Study the harness code above to determine the expected format.")
@@ -427,7 +706,121 @@ def generate_seeds(root, out_dir, model="gpt-4o"):
     except Exception as e:
         print("Warning: seeds.json parse error: " + str(e))
 
+    # Generic addition: emit a libFuzzer dictionary file from numeric
+    # constants found in the patch / vulnerable function source plus any
+    # short string literals appearing in that source. libFuzzer consumes
+    # the dict via -dict= and uses tokens for splice/insert mutations,
+    # which is exactly what smoke-only cases (sink reached, trigger value
+    # missed) need.  Strictly format/library-agnostic.
+    try:
+        _emit_seed_dict(out_dir, harness_plan_path, vulns_path, root)
+    except Exception as e:
+        print("Warning: seed dict emit failed: " + str(e))
+
     return seeds_path
+
+
+def _emit_seed_dict(out_dir, harness_plan_path, vulns_path, root):
+    """Write seeds.dict in libFuzzer dictionary format. Generic: tokens
+    are mined from patch diff numeric constants + short string literals
+    in the vulnerable function source. No library knowledge."""
+    try:
+        harness_plan = json.loads(harness_plan_path.read_text(encoding='utf-8'))
+    except Exception:
+        harness_plan = {}
+    try:
+        vulns_data = json.loads(vulns_path.read_text(encoding='utf-8'))
+        vulns = vulns_data.get('vulnerabilities', vulns_data.get('vulns', []))
+    except Exception:
+        vulns = []
+    vuln_source, _ = get_vulnerable_function_source(harness_plan, root)
+    patch_diffs = []
+    for v in vulns:
+        # Different enrichment versions used singular/plural keys.
+        for key in ('patch_diffs', 'patch_diff', 'patch'):
+            d = v.get(key)
+            if not d:
+                continue
+            if isinstance(d, list):
+                for item in d:
+                    if item:
+                        patch_diffs.append(str(item))
+            else:
+                patch_diffs.append(str(d))
+
+    # Numeric constants -> emit decimal-string token + 4-byte little-endian
+    # binary token for each value (covers ASCII numerics as well as packed
+    # struct fields).
+    diff_consts = []
+    for d in patch_diffs:
+        diff_consts.extend(_mine_diff_constants(d))
+    src_consts = _mine_numeric_constants(vuln_source, max_constants=20,
+                                          exclude=set(diff_consts))
+    all_consts = []
+    seen_dc = set()
+    for c in diff_consts + src_consts:
+        if c in seen_dc:
+            continue
+        seen_dc.add(c)
+        all_consts.append(c)
+
+    def _to_int(tok):
+        try:
+            if tok.lower().startswith("0x"):
+                return int(tok, 16)
+            return int(tok)
+        except Exception:
+            return None
+
+    lines = []
+    for tok in all_consts[:30]:
+        # decimal-string form (works for text protocols)
+        lines.append(f'"{tok}"')
+        v = _to_int(tok)
+        if v is None or v < 0:
+            continue
+        # 1-, 2-, 4-, 8-byte little-endian binary forms
+        for nbytes in (1, 2, 4, 8):
+            try:
+                b = v.to_bytes(nbytes, 'little', signed=False)
+            except OverflowError:
+                continue
+            esc = ''.join(f'\\x{x:02x}' for x in b)
+            lines.append(f'"{esc}"')
+
+    # Short ASCII string literals from vulnerable source ("...") of length
+    # 2..16. Useful for format-aware fuzzers (XML/JSON/CSV/etc.) without
+    # any per-format hardcoding.
+    if vuln_source:
+        import re as _re
+        str_re = _re.compile(r'"([^"\\\n]{2,16})"')
+        seen_s = set()
+        for m in str_re.finditer(vuln_source):
+            s = m.group(1)
+            if not all(0x20 <= ord(c) < 0x7f for c in s):
+                continue
+            if s.isspace():
+                continue
+            if s in seen_s:
+                continue
+            seen_s.add(s)
+            esc = s.replace('\\', '\\\\').replace('"', '\\"')
+            lines.append(f'"{esc}"')
+            if len(seen_s) >= 30:
+                break
+
+    if not lines:
+        return
+    dedup = []
+    seen_l = set()
+    for ln in lines:
+        if ln not in seen_l:
+            seen_l.add(ln)
+            dedup.append(ln)
+    dict_path = out_dir / "seeds.dict"
+    dict_path.write_text("# auto-generated libFuzzer dictionary\n" +
+                         "\n".join(dedup) + "\n", encoding='utf-8')
+    print(f"Seed dictionary written to {dict_path} ({len(dedup)} tokens)")
 
 
 def main():

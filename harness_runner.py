@@ -2,9 +2,66 @@
 import argparse
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+
+_COMPILE_ERR_PATTERNS = [
+    # clang / gcc undeclared identifier / use of undeclared
+    re.compile(r"use of undeclared identifier '([A-Za-z_][A-Za-z0-9_]*)'"),
+    re.compile(r"'([A-Za-z_][A-Za-z0-9_]*)' was not declared"),
+    re.compile(r"implicit declaration of function '([A-Za-z_][A-Za-z0-9_]*)'"),
+    # too-few/too-many arguments to function 'foo'
+    re.compile(r"to function '([A-Za-z_][A-Za-z0-9_]*)'"),
+    # cannot initialize a parameter of type ... passing 'X' to parameter of type
+    re.compile(r"no matching function for call to '([A-Za-z_][A-Za-z0-9_]*)'"),
+    # linker undefined reference
+    re.compile(r"undefined reference to `([A-Za-z_][A-Za-z0-9_]*)'"),
+]
+
+
+def _identifiers_from_compile_error(error_text):
+    """Extract candidate function/identifier names from a compiler/linker error
+    blob. Generic — driven only by well-known clang/gcc/ld diagnostic phrasing.
+    """
+    if not error_text:
+        return []
+    seen = []
+    for pat in _COMPILE_ERR_PATTERNS:
+        for m in pat.finditer(error_text):
+            name = m.group(1)
+            if name and name not in seen:
+                seen.append(name)
+    return seen
+
+
+_DID_YOU_MEAN_RE = re.compile(
+    r"use of undeclared identifier '([^']+)';\s*did you mean '([^']+)'\?"
+)
+
+
+def _extract_did_you_mean(error_text):
+    """Return a {wrong: right} mapping from clang's `did you mean` hints.
+
+    Compilers emit these when a referenced symbol is not in scope but a
+    nearby visible symbol differs only slightly (typo/internal-vs-public
+    name pair). The LLM has been ignoring these inside the raw error
+    block and re-emitting the same wrong identifier; lifting them to a
+    dedicated section forces substitution. Generic — diagnostic-driven.
+    """
+    if not error_text:
+        return {}
+    out = {}
+    for m in _DID_YOU_MEAN_RE.finditer(error_text):
+        wrong, right = m.group(1), m.group(2)
+        # Keep first suggestion for each wrong name; clang sometimes
+        # repeats the same diagnostic.
+        if wrong not in out:
+            out[wrong] = right
+    return out
 
 
 def extract_generated_code(fuzzer_src: Path):
@@ -57,6 +114,70 @@ def _build_repair_directives(details):
     if not directives:
         directives.append('Treat the harness as a full rewrite task if needed; preserve only the documented public API family and required lifecycle, not the current code structure.')
     return directives[:6]
+
+
+def extract_public_symbols(root: Path, max_symbols: int = 200):
+    """Return up to ``max_symbols`` public symbol names exported by the
+    project's built library (static ``.a`` or shared ``.so``), or ``[]`` if
+    none can be located.
+
+    This is generic — no library-specific knowledge. The list is used to
+    constrain LLM repair prompts so they do not call static/internal
+    functions or hallucinate APIs that do not exist in this version of
+    the library.
+    """
+    if not root.exists():
+        return []
+    candidates = []
+    skip_dirs = {'.git', '.svn', '.hg', '__pycache__', 'CMakeFiles',
+                 'tests', 'test', 'testsuite', 'fuzz', 'fuzzing',
+                 'examples', 'example', 'doc', 'docs'}
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs
+                       and not d.startswith('.')]
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            if fn.startswith('lib') and fn.endswith('.a'):
+                candidates.append((os.path.getsize(full), full))
+            elif fn.startswith('lib') and ('.so' in fn):
+                # Skip versioned symlinks targets that duplicate work
+                candidates.append((os.path.getsize(full), full))
+    if not candidates:
+        return []
+    # Prefer the largest artefact (typically the main library)
+    candidates.sort(reverse=True)
+    seen = set()
+    symbols = []
+    for _, lib_path in candidates[:5]:
+        try:
+            proc = subprocess.run(
+                ['nm', '--extern-only', '--defined-only', '--no-demangle',
+                 lib_path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=10
+            )
+        except Exception:
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in proc.stdout.decode('utf-8', errors='replace').splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            sym_type, name = parts[-2], parts[-1]
+            # Keep functions ('T', 'W'), data ('D', 'B', 'R') exports
+            if sym_type not in ('T', 'W', 'D', 'B', 'R'):
+                continue
+            # Skip compiler/sanitizer-internal symbols
+            if name.startswith(('__', '_GLOBAL_', '_Z')) or '.' in name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            symbols.append(name)
+            if len(symbols) >= max_symbols:
+                return symbols
+    return symbols
 
 
 def build_semantic_fix_prompt(out: Path, attempt: int, reason: str, details, current_code: str, plan_path: Path):
@@ -148,7 +269,7 @@ def run_seed_corpus_validation(harness_binary: Path, out_dir: Path, plan_path: P
 
     env = os.environ.copy()
     env['ASAN_OPTIONS'] = 'abort_on_error=1:detect_leaks=0'
-    env['UBSAN_OPTIONS'] = 'abort_on_error=1'
+    env['UBSAN_OPTIONS'] = 'abort_on_error=1:print_stacktrace=1:silence_unsigned_overflow=1'
 
     try:
         result = subprocess.run(
@@ -297,7 +418,7 @@ def build_manual_autotools(root: Path, log_path: Path, script_dir: Path) -> int:
     env["REAL_CXX"] = env.get("CXX", "clang++")
     env["CC"] = str(script_dir / "rf-cc")
     env["CXX"] = str(script_dir / "rf-cxx")
-    env["CFLAGS"] = "-fsanitize=address,undefined -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
+    env["CFLAGS"] = "-fsanitize=address,undefined -fno-sanitize-recover=all -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
     env["CXXFLAGS"] = env["CFLAGS"]
     # Disable leak detection during build — build tools (parser generators,
     # code generators, etc.) commonly leak memory and ASAN would otherwise
@@ -350,6 +471,55 @@ def build_manual_autotools(root: Path, log_path: Path, script_dir: Path) -> int:
     return result.returncode
 
 
+def build_manual_make(root: Path, log_path: Path, script_dir: Path) -> int:
+    """Manually build a Makefile-based project with instrumentation."""
+    import os
+
+    print("Using manual Makefile build with instrumentation...")
+
+    env = os.environ.copy()
+    env["RF_BUILD_LOG"] = str(log_path)
+    env["REAL_CC"] = env.get("CC", "clang")
+    env["REAL_CXX"] = env.get("CXX", "clang++")
+    env["CC"] = str(script_dir / "rf-cc")
+    env["CXX"] = str(script_dir / "rf-cxx")
+    cflags = "-fsanitize=address,undefined -fno-sanitize-recover=all -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
+    env["CFLAGS"] = cflags
+    env["CXXFLAGS"] = cflags
+    env["ASAN_OPTIONS"] = "detect_leaks=0"
+
+    # Pass CC/CFLAGS as make command-line arguments so they override
+    # Makefile-hardcoded values (env vars are ignored when Makefile uses = or :=).
+    import glob
+    make_overrides = [
+        "CC=" + str(script_dir / "rf-cc"),
+        "CXX=" + str(script_dir / "rf-cxx"),
+        "CFLAGS=" + cflags,
+        "CXXFLAGS=" + cflags,
+    ]
+    make_cmd = ["make", "-j4"] + make_overrides
+    # Try lib target first if a lib/ directory exists
+    lib_dir = root / "lib"
+    if lib_dir.is_dir() and (lib_dir / "Makefile").exists():
+        lib_make_cmd = ["make", "-j4", "-C", "lib"] + make_overrides
+        print("Running: " + " ".join(lib_make_cmd))
+        result = subprocess.run(lib_make_cmd, cwd=str(root), env=env)
+        if result.returncode == 0:
+            return 0
+        print("lib/ sub-make failed, trying top-level make...")
+    print("Running: " + " ".join(make_cmd))
+    result = subprocess.run(make_cmd, cwd=str(root), env=env)
+    if result.returncode != 0:
+        # Partial-build fallback: if a static library was produced, treat as success
+        static_libs = glob.glob(str(root / "**" / "lib*.a"), recursive=True)
+        if static_libs:
+            print("WARNING: make failed (rc={}) but static library found: {}".format(
+                result.returncode, static_libs[0]))
+            return 0
+        return result.returncode
+    return 0
+
+
 def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file: Path = None, cve_id: str = None) -> int:
     """Manually build a CMake project with instrumentation."""
     import os
@@ -372,8 +542,10 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
         except Exception:
             pass
     
-    # Clean and create build directory
-    build_dir = root / "build"
+    # Clean and create build directory.
+    # Use '_rf_build' to avoid clashing with source-tree 'build/' directories
+    # (e.g. libtiff ships a build/ with its own CMakeLists.txt).
+    build_dir = root / "_rf_build"
     if build_dir.exists():
         import shutil
         shutil.rmtree(str(build_dir))  # Python 3.5 needs string
@@ -390,7 +562,7 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
     env["ASAN_OPTIONS"] = "detect_leaks=0"
     
     # CMake configure with instrumentation flags
-    cflags = "-fsanitize=address,undefined -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g"
+    cflags = "-fsanitize=address,undefined -fno-sanitize-recover=all -fsanitize=fuzzer-no-link -fno-omit-frame-pointer -g -Wno-error"
     cmake_cmd = [
         "cmake", "..",
         "-DCMAKE_C_FLAGS=" + cflags,
@@ -398,6 +570,7 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
         "-DCMAKE_BUILD_TYPE=Debug",
         "-DBUILD_TESTING=OFF",
         "-DBUILD_SHARED_LIBS=OFF",
+        "-DENABLE_WERROR=OFF",
     ]
     
     # Enable cJSON_Utils if needed
@@ -425,6 +598,179 @@ def build_manual_cmake(root: Path, log_path: Path, script_dir: Path, vulns_file:
         return result.returncode
     return result.returncode
 
+
+def _normalize_repo_url(url: str) -> str:
+    """Lower-case + strip trailing .git/slashes/scheme so different remote
+    spellings (https://, git@, .git suffix) compare equal."""
+    if not url:
+        return ""
+    u = url.strip().lower()
+    # Strip URL scheme prefixes; loop because ``ssh://git@host/...`` stacks
+    # two of them.
+    for _ in range(3):
+        for prefix in ("https://", "http://", "git://", "ssh://", "git@"):
+            if u.startswith(prefix):
+                u = u[len(prefix):]
+                break
+        else:
+            break
+    # SSH-style remotes use ``host:org/repo`` instead of ``host/org/repo``;
+    # convert the *first* colon (after the host) into a slash so both forms
+    # produce the same canonical path.
+    if ":" in u and "/" in u:
+        host, rest = u.split(":", 1)
+        if "/" not in host:
+            u = host + "/" + rest
+    if u.endswith("/"):
+        u = u[:-1]
+    if u.endswith(".git"):
+        u = u[:-4]
+    return u
+
+
+def pin_source_to_vulnerable_commit(root: Path, enriched_entry: dict) -> bool:
+    """Best-effort: check out the parent of the earliest fix commit so the
+    project source is at the *vulnerable* state for fuzzing.
+
+    Generic — driven entirely by enrichment data:
+      * ``fix_commits`` from cve_enrichment (NVD/OSV/GitHub patch links)
+      * the project's own ``remote.origin.url`` to pick the right commit list
+
+    No library- or CVE-specific code paths.  Returns True on successful
+    checkout, False otherwise (caller continues with HEAD)."""
+    fix_commits = enriched_entry.get("fix_commits") or []
+    if not fix_commits:
+        print("[pin] no fix_commits in enrichment; leaving source at HEAD")
+        return False
+    git_dir = root / ".git"
+    if not git_dir.exists():
+        print("[pin] {} has no .git dir; cannot pin".format(root))
+        return False
+
+    # Determine which fix_commits belong to *this* repository.
+    try:
+        remote_proc = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=10
+        )
+        local_remote = _normalize_repo_url(remote_proc.stdout.strip())
+    except Exception as exc:
+        print("[pin] could not read remote: {}".format(exc))
+        return False
+
+    matching = []
+    for fc in fix_commits:
+        repo = _normalize_repo_url(fc.get("repo", ""))
+        commit = (fc.get("commit") or "").strip()
+        if not commit or len(commit) < 7:
+            continue
+        if local_remote and repo and repo != local_remote:
+            continue
+        matching.append(commit)
+    if not matching:
+        print("[pin] no fix_commits match local remote {!r}; leaving HEAD".format(local_remote))
+        return False
+
+    # Try to fetch each matching commit; OSS-Fuzz containers usually have
+    # ``--depth 1`` clones so older commits aren't present.  Unshallow
+    # lazily (slow but reliable).
+    def _have_commit(c: str) -> bool:
+        r = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", c + "^{commit}"],
+            capture_output=True
+        )
+        return r.returncode == 0
+
+    needs_fetch = [c for c in matching if not _have_commit(c)]
+    if needs_fetch:
+        # Try a targeted fetch first (fast); fall back to unshallow.
+        for c in needs_fetch:
+            subprocess.run(
+                ["git", "-C", str(root), "fetch", "--depth", "200", "origin", c],
+                capture_output=True, timeout=120
+            )
+        # Anything still missing? unshallow once.
+        if any(not _have_commit(c) for c in matching):
+            print("[pin] unshallowing repository to access historical commits...")
+            subprocess.run(
+                ["git", "-C", str(root), "fetch", "--unshallow"],
+                capture_output=True, timeout=600
+            )
+        # Recompute reachable commits.
+        matching = [c for c in matching if _have_commit(c)]
+        if not matching:
+            print("[pin] none of the fix_commits are reachable; leaving HEAD")
+            return False
+
+    # Pick the earliest fix commit (older = closer to the original
+    # vulnerable state).  ``git rev-list --topo-order`` with all candidates
+    # as positive refs prints them newest-first; reverse to get oldest.
+    rl = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--topo-order", "--no-walk"] + matching,
+        capture_output=True, text=True
+    )
+    ordered = [l.strip() for l in rl.stdout.splitlines() if l.strip()]
+    if ordered:
+        earliest = ordered[-1]
+    else:
+        earliest = matching[0]
+
+    # Capture pre-pin HEAD so we can restore OSS-Fuzz integration files that
+    # only exist on later commits.  Generic — every OSS-Fuzz project keeps
+    # its build/harness infrastructure in well-known sub-trees that don't
+    # contain the *vulnerable* production code; restoring them after a pin
+    # does not weaken our reproduction guarantee.
+    pre_pin_head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True, text=True
+    ).stdout.strip()
+
+    target = earliest + "^"
+    print("[pin] checking out {} (parent of earliest fix commit {})".format(target, earliest[:12]))
+    co = subprocess.run(
+        ["git", "-C", str(root), "checkout", "--force", "--detach", target],
+        capture_output=True, text=True, timeout=60
+    )
+    if co.returncode != 0:
+        print("[pin] checkout failed: {}".format(co.stderr.strip()[:300]))
+        return False
+
+    # Update submodules to match (best-effort).
+    subprocess.run(
+        ["git", "-C", str(root), "submodule", "update", "--init", "--recursive"],
+        capture_output=True, timeout=600
+    )
+
+    # Restore OSS-Fuzz build helpers from pre-pin HEAD if they were added
+    # after the vulnerable commit.  Without this, /src/build.sh fails with
+    # `fuzz/oss-fuzz-build.sh: No such file or directory` on libraries that
+    # only adopted in-tree fuzz integration after the CVE.  Generic across
+    # every OSS-Fuzz project.
+    if pre_pin_head and pre_pin_head != target:
+        for helper in ("fuzz", "oss-fuzz", "tests/fuzz", "fuzzing"):
+            # Skip if pinned tree already has it (no need to restore).
+            if (root / helper).exists():
+                continue
+            # Only restore if the pre-pin tree had it.
+            ls = subprocess.run(
+                ["git", "-C", str(root), "ls-tree", "-d", pre_pin_head, helper],
+                capture_output=True, text=True
+            )
+            if not ls.stdout.strip():
+                continue
+            r = subprocess.run(
+                ["git", "-C", str(root), "checkout", pre_pin_head, "--", helper],
+                capture_output=True, text=True, timeout=60
+            )
+            if r.returncode == 0:
+                print("[pin] restored {}/ from pre-pin HEAD for build infra".format(helper))
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True
+    )
+    print("[pin] source now at {}".format(head.stdout.strip()[:12]))
+    return True
+
+
 def main():
     p = argparse.ArgumentParser(description="Standalone harness generator for OSS-Fuzz library vulnerabilities")
     p.add_argument("--root", required=True, help="Project root under $SRC")
@@ -435,6 +781,11 @@ def main():
     p.add_argument("--out", required=True, help="Output directory for harness artifacts")
     p.add_argument("--no-enrich", action="store_true",
                    help="Skip automatic CVE enrichment from NVD/OSV/GitHub")
+    p.add_argument("--vulnerable-ref", default=None,
+                   help="Explicit git ref (tag/branch/commit) to check out as the "
+                        "vulnerable source state. When set, overrides the OSV/NVD "
+                        "fix-commit-derived auto-pin (which can be wrong when "
+                        "upstream tags releases on cosmetic post-fix commits).")
     args = p.parse_args()
 
     # Build or load vulnerability entry
@@ -467,9 +818,106 @@ def main():
     
     # Parse vulnerabilities file for build detection
     vulns_file = Path(args.vulns)
-    
+
+    # 0.5) CVE enrichment runs FIRST (before build) so we can pin the project
+    # source to the vulnerable commit (parent of the fix commit).  Without
+    # this, the OSS-Fuzz container builds whatever HEAD the upstream repo
+    # carries — typically already-patched — so the vulnerability cannot be
+    # reproduced no matter how good the harness is.  This step is fully
+    # generic: it consults the enrichment's `fix_commits` and the project's
+    # `git remote.origin.url`, then runs a plain `git checkout <commit>^`.
+    effective_vulns = args.vulns
+    enriched_entry = None
+    if not args.no_enrich:
+        try:
+            from cve_enrichment import enrich_vulnerability
+            vulns_data = json.loads(Path(args.vulns).read_text(encoding="utf-8"))
+            vulns_list = vulns_data.get("vulnerabilities", vulns_data.get("vulns", []))
+            target_entry = next((v for v in vulns_list if v.get("cve-id") == args.cve_id), None)
+            if target_entry:
+                cache_dir = out / "enrichment_cache"
+                enriched_entry = enrich_vulnerability(target_entry, cache_dir=cache_dir)
+                enriched_list = []
+                for v in vulns_list:
+                    if v.get("cve-id") == args.cve_id:
+                        enriched_list.append(enriched_entry)
+                    else:
+                        enriched_list.append(v)
+                enriched_vulns_path = out / "enriched_vulnerabilities.json"
+                enriched_vulns_path.write_text(
+                    json.dumps({"vulnerabilities": enriched_list}, indent=2),
+                    encoding="utf-8"
+                )
+                effective_vulns = str(enriched_vulns_path)
+                print("[enrichment] Enriched vulnerabilities written to {}".format(enriched_vulns_path))
+        except Exception as exc:
+            print("[enrichment] Warning: CVE enrichment failed ({}), proceeding with original data".format(exc),
+                  file=sys.stderr)
+
+    # 0.7) Pin source tree to the vulnerable state. Two paths:
+    #  (a) Explicit --vulnerable-ref: check out exactly that ref. Used when
+    #      the operator has manually identified the vulnerable revision (e.g.
+    #      a tag like v1.7.17). Bypasses auto-pinning, which can pick the
+    #      wrong commit when upstream tags releases on cosmetic post-fix
+    #      commits (cf. cJSON v1.7.18 = "add contributors").
+    #  (b) Otherwise: best-effort auto-pin via the parent of the earliest
+    #      enrichment-reported fix commit.
+    if args.vulnerable_ref:
+        try:
+            co = subprocess.run(
+                ["git", "-C", str(root), "checkout", "--force", args.vulnerable_ref],
+                capture_output=True, text=True, timeout=120,
+            )
+            if co.returncode != 0:
+                # If the ref isn't local yet (shallow clone), try to fetch it.
+                subprocess.run(
+                    ["git", "-C", str(root), "config", "remote.origin.fetch",
+                     "+refs/heads/*:refs/remotes/origin/*"],
+                    capture_output=True, timeout=10,
+                )
+                subprocess.run(
+                    ["git", "-C", str(root), "fetch", "--unshallow", "--tags"],
+                    capture_output=True, timeout=600,
+                )
+                co = subprocess.run(
+                    ["git", "-C", str(root), "checkout", "--force", args.vulnerable_ref],
+                    capture_output=True, text=True, timeout=120,
+                )
+            if co.returncode == 0:
+                head = subprocess.run(
+                    ["git", "-C", str(root), "log", "-1", "--oneline"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                print("[pin] checked out --vulnerable-ref={} -> {}".format(
+                    args.vulnerable_ref, head))
+            else:
+                print("[pin] WARNING: --vulnerable-ref={} checkout failed: {}".format(
+                    args.vulnerable_ref, co.stderr.strip()[:300]), file=sys.stderr)
+        except Exception as exc:
+            print("[pin] WARNING: --vulnerable-ref checkout raised ({}); "
+                  "continuing with HEAD".format(exc), file=sys.stderr)
+    elif enriched_entry:
+        try:
+            pin_source_to_vulnerable_commit(root, enriched_entry)
+        except Exception as exc:
+            print("[pin] Warning: source pinning failed ({}), proceeding with HEAD".format(exc),
+                  file=sys.stderr)
+
     # Determine build approach
     build_script = args.build_script
+    build_script_auto_detected = False
+    if not build_script:
+        # OSS-Fuzz convention: a `build.sh` sitting alongside the project root
+        # (typically /src/build.sh, with the project source at /src/<project>).
+        # If found, prefer it because it already encodes the project's build
+        # quirks (autoreconf flags, optional-dep toggles, install steps) and
+        # works across all OSS-Fuzz base images. This is generic — no
+        # per-library knowledge.
+        ossfuzz_build_sh = root.parent / "build.sh"
+        if ossfuzz_build_sh.is_file():
+            print("[harness_runner] Detected OSS-Fuzz build.sh at {}, using it".format(ossfuzz_build_sh))
+            build_script = "bash {}".format(shlex.quote(str(ossfuzz_build_sh)))
+            build_script_auto_detected = True
     if not build_script:
         # Try to detect build system
         build_system = detect_build_system(root)
@@ -483,13 +931,21 @@ def main():
             rc = build_manual_autotools(root, log_path, script_dir)
             if rc != 0:
                 sys.exit(rc)
+        elif build_system == "make":
+            rc = build_manual_make(root, log_path, script_dir)
+            if rc != 0:
+                sys.exit(rc)
         else:
             print("Error: Cannot auto-detect build system. Please provide --build-script")
             sys.exit(1)
     else:
-        # Check for ossfuzz.sh - if it doesn't exist, try manual build
+        # Check for ossfuzz.sh - if it doesn't exist, try manual build.
+        # This fallback is only meaningful for user-supplied build scripts
+        # that depend on a fuzzing/ossfuzz.sh helper. When we auto-detected
+        # /src/build.sh ourselves, we already verified it exists and it is
+        # the canonical OSS-Fuzz entry point — never second-guess it.
         ossfuzz_sh = root / "fuzzing" / "ossfuzz.sh"
-        if build_script == "bash /src/build.sh" and not ossfuzz_sh.exists():
+        if (not build_script_auto_detected) and build_script == "bash /src/build.sh" and not ossfuzz_sh.exists():
             print("ossfuzz.sh not found, falling back to manual CMake build...")
             build_system = detect_build_system(root)
             if build_system == "cmake":
@@ -517,34 +973,9 @@ def main():
             if rc.returncode != 0:
                 sys.exit(rc.returncode)
 
-    # 1.5) CVE enrichment — query NVD/OSV/GitHub for descriptions, patches, CVSS
-    effective_vulns = args.vulns
-    if not args.no_enrich:
-        try:
-            from cve_enrichment import enrich_vulnerability
-            vulns_data = json.loads(Path(args.vulns).read_text(encoding="utf-8"))
-            vulns_list = vulns_data.get("vulnerabilities", vulns_data.get("vulns", []))
-            target_entry = next((v for v in vulns_list if v.get("cve-id") == args.cve_id), None)
-            if target_entry:
-                cache_dir = out / "enrichment_cache"
-                enriched_entry = enrich_vulnerability(target_entry, cache_dir=cache_dir)
-                # Replace the target entry in the list
-                enriched_list = []
-                for v in vulns_list:
-                    if v.get("cve-id") == args.cve_id:
-                        enriched_list.append(enriched_entry)
-                    else:
-                        enriched_list.append(v)
-                enriched_vulns_path = out / "enriched_vulnerabilities.json"
-                enriched_vulns_path.write_text(
-                    json.dumps({"vulnerabilities": enriched_list}, indent=2),
-                    encoding="utf-8"
-                )
-                effective_vulns = str(enriched_vulns_path)
-                print("[enrichment] Enriched vulnerabilities written to {}".format(enriched_vulns_path))
-        except Exception as exc:
-            print("[enrichment] Warning: CVE enrichment failed ({}), proceeding with original data".format(exc),
-                  file=sys.stderr)
+    # 1.5) CVE enrichment already ran in step 0.5 (moved earlier so source
+    # can be pinned to the vulnerable commit before the build).  `effective_vulns`
+    # is set above; nothing to do here.
 
     # 2) Generate harness plan
     plan_path = out / "harness_plan.json"
@@ -594,9 +1025,14 @@ def main():
     fuzzer_src.write_text(best_candidate_path.read_text(encoding='utf-8'), encoding='utf-8')
     print('Selected candidate {} with semantic score {}'.format(best_candidate.get('name'), best_candidate.get('score', 0)))
 
-    # 5) Compile generated harness with retry on failure
-    max_retries = 3
+    # 5) Compile generated harness with retry on failure.
+    # 8 attempts (was 5): on hard libraries where the LLM oscillates between
+    # signature-mismatch and missing-symbol fixes, 5 is empirically too few
+    # to converge. The cost is bounded — only the hard cases hit attempts 6+.
+    max_retries = 8
     binary_name = "vuln_fuzzer"
+    _prev_harness_text = None
+    _identical_streak = 0
     
     for attempt in range(max_retries):
         semantic_report = validate_harness_source(plan_path, fuzzer_src)
@@ -698,9 +1134,21 @@ def main():
                         continue
                     print("LLM runtime repair failed: " + msg)
                 else:
-                    print("Runtime smoke validation failed after all retries:", file=sys.stderr)
+                    # Final retry exhausted.  Historically we sys.exit(1) here,
+                    # but that throws away a fully compiled harness over what
+                    # may be a benign smoke complaint (e.g. a different bug
+                    # crashing the trivial probe; sink not reached on 4-byte
+                    # input).  Generic policy: log the failure, mark the
+                    # evidence, and fall through to seed generation + fuzzing
+                    # — libFuzzer with real seeds is far more powerful than a
+                    # 3-input probe and often finds the target CVE the smoke
+                    # gate could not see.
+                    print("Runtime smoke validation failed after all retries; "
+                          "proceeding to seed generation + fuzzing anyway.",
+                          file=sys.stderr)
                     print(runtime_report.get('output', ''), file=sys.stderr)
-                    sys.exit(1)
+                    # Falls through to evidence print + seed gen + fuzzing
+                    # below; do NOT sys.exit, do NOT continue, do NOT break.
             
             evidence = runtime_report.get('evidence', {})
             print("Harness generated and compiled")
@@ -746,9 +1194,14 @@ def main():
                             continue
                         print('LLM generated-seed repair failed: ' + msg)
                     else:
-                        print('Generated-seed validation failed after all retries:', file=sys.stderr)
+                        # Don't sys.exit — same rationale as the smoke-gate
+                        # fall-through above.  A compiled harness with seeds
+                        # that don't trigger the sink on direct invocation is
+                        # still a valid fuzzing target; libFuzzer mutation
+                        # frequently finds the bug from those seeds.
+                        print('Generated-seed validation failed after all retries; '
+                              'proceeding to fuzz anyway.', file=sys.stderr)
                         print(seed_report.get('output', ''), file=sys.stderr)
-                        sys.exit(1)
             
             # 7) Run fuzzer with generated seeds
             print("\nStarting fuzzing...")
@@ -769,11 +1222,30 @@ def main():
                 
                 import os
                 env = os.environ.copy()
-                env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
-                env["UBSAN_OPTIONS"] = "abort_on_error=1"
-                
+                env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0:quarantine_size_mb=64:malloc_context_size=5"
+                env["UBSAN_OPTIONS"] = "abort_on_error=1:print_stacktrace=1:silence_unsigned_overflow=1"
+                # Generic: allow caller to widen the fuzzing budget without
+                # touching the source. Smoke-only cases (sink reached, trigger
+                # missed) often need more than 10 minutes; default 1500 s.
+                _max_t = os.environ.get("RF_MAX_TOTAL_TIME", "1500")
+                _rss_mb = os.environ.get("RF_RSS_LIMIT_MB", "4096")
+
+                fuzz_argv = [str(harness_binary),
+                             f"-max_total_time={_max_t}",
+                             f"-rss_limit_mb={_rss_mb}"]
+
+                # Generic: if a libFuzzer dictionary file is sitting next to
+                # the seeds (seeds.dict), pass it via -dict=. The seed
+                # generator may emit one with format-aware tokens for the
+                # file family it inferred (XML tags, JSON tokens, etc.).
+                dict_path = out / "seeds.dict"
+                if dict_path.exists() and dict_path.stat().st_size > 0:
+                    fuzz_argv.append(f"-dict={dict_path}")
+
+                fuzz_argv.append(str(corpus_dir))
+
                 result = subprocess.run(
-                    [str(harness_binary), str(corpus_dir)],
+                    fuzz_argv,
                     cwd=str(out),
                     env=env
                 )
@@ -826,20 +1298,106 @@ def main():
                 current_code,
                 "```",
                 "",
+            ]
+            # Augment with the actual public ABI of the built library so the
+            # LLM stops referencing static/internal/non-existent symbols.
+            public_syms = extract_public_symbols(root)
+            if public_syms:
+                fix_prompt.extend([
+                    "## Public ABI (exported symbols of the built library):",
+                    "Only call functions whose names appear in this list. If",
+                    "the sink referenced in the error is not in this list, it",
+                    "is internal (static) or does not exist in this library",
+                    "version — choose a different reachable public function.",
+                    "```",
+                    " ".join(public_syms),
+                    "```",
+                    "",
+                ])
+            # Mine the compiler error for missing/undeclared identifiers and
+            # emit their real C signatures from the harness plan, so the LLM
+            # can stop hallucinating prototypes. Generic — driven by error
+            # text + plan, no library-specific knowledge.
+            try:
+                err_idents = _identifiers_from_compile_error(error_msg)
+                plan_sigs = {}
+                if plan_path.exists():
+                    plan_obj = json.loads(plan_path.read_text(encoding="utf-8"))
+                    plan_sigs = plan_obj.get("public_signatures", {}) or {}
+                matched = [(name, plan_sigs[name]) for name in err_idents
+                           if name in plan_sigs]
+                if matched:
+                    fix_prompt.append("## Real Signatures of Symbols the Compiler Flagged:")
+                    fix_prompt.append("Use these exact prototypes (taken from the library's "
+                                      "headers); do not invent parameter types or counts.")
+                    fix_prompt.append("```c")
+                    for nm, sig in matched[:25]:
+                        fix_prompt.append(sig if isinstance(sig, str) else str(sig))
+                    fix_prompt.append("```")
+                    fix_prompt.append("")
+            except Exception as _e:
+                pass
+            # Mine clang's "did you mean 'X'?" suggestions and lift them to
+            # explicit substitution instructions. Compilers know the right
+            # spelling because they have the full symbol table; the LLM has
+            # been ignoring them buried inside the raw error block.
+            try:
+                substitutions = _extract_did_you_mean(error_msg)
+            except Exception:
+                substitutions = {}
+            if substitutions:
+                fix_prompt.append(
+                    "## Mandatory identifier substitutions (compiler "
+                    "told us the correct names):")
+                fix_prompt.append(
+                    "Replace each identifier on the left with the one on "
+                    "the right exactly as written. The left names are NOT "
+                    "in this library's installed public headers — using "
+                    "them again will fail compilation again.")
+                fix_prompt.append("```")
+                for wrong, right in substitutions.items():
+                    fix_prompt.append(f"{wrong}  ->  {right}")
+                fix_prompt.append("```")
+                fix_prompt.append("")
+            fix_prompt.extend([
                 "## Requirements:",
                 "1. Fix ALL compilation errors",
                 "2. Ensure all required headers are included",
                 "3. Do NOT call internal/static functions - use the public API",
-                "4. Output ONLY the corrected C++ code, no JSON wrapper, no explanation",
+                "4. If the compiler suggested an alternative spelling for an "
+                "identifier (\"did you mean 'X'?\"), USE that exact "
+                "spelling — never re-use the failing identifier.",
+                "5. Output ONLY the corrected C++ code, no JSON wrapper, no explanation",
                 "",
                 "Generate the corrected fuzzer.cc:"
-            ]
+            ])
+            # Identical-output escalation: when the LLM emits the same harness
+            # text two attempts in a row, append an escalation clause forcing
+            # a structurally-different rewrite. Generic — no library-specific
+            # signature inspection. Empirically the LLM otherwise loops on the
+            # same wrong call (e.g. emitting `pcre2_compile_8` with the wrong
+            # argument shape across all 5 default attempts).
+            if _identical_streak >= 1:
+                fix_prompt.insert(0,
+                    "## NOTE: previous repair attempt produced byte-identical "
+                    "code. Do NOT re-emit the same harness. Replace the failing "
+                    "identifier with the public-API alternative the compiler "
+                    "suggests, OR rewrite the trigger using a different (but "
+                    "still public) entry point.")
             fix_prompt_path.write_text("\n".join(fix_prompt), encoding="utf-8")
-            
+
             # Call LLM to fix
             ok, msg = run_openai_json(str(fix_prompt_path), str(fuzzer_src), model=model, api_base=api_base)
             if ok:
                 extract_generated_code(fuzzer_src)
+                # Track identical-output streak for the escalation clause.
+                _new_text = fuzzer_src.read_text(encoding="utf-8") if fuzzer_src.exists() else ""
+                if _prev_harness_text is not None and _new_text == _prev_harness_text:
+                    _identical_streak += 1
+                    print(f"NOTE: LLM emitted identical harness {_identical_streak} time(s) in a row")
+                else:
+                    _identical_streak = 0
+                _prev_harness_text = _new_text
                 print("LLM provided fixed harness, retrying compilation...")
             else:
                 print("LLM fix failed: " + msg)

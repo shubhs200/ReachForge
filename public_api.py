@@ -121,16 +121,18 @@ def extract_function_signatures(include_dirs: Set[str], export_macros: Set[str] 
     import re
     
     # Private header patterns - these contain internal functions
+    # Case-insensitive to catch e.g. parserInternals.h, xmlInternals.h
     private_header_patterns = [
-        r'priv\.h$',           # pngpriv.h, zlibpriv.h
-        r'private\.h$',        # private.h
-        r'internal\.h$',       # internal.h
-        r'_priv\.h$',          # lib_priv.h
-        r'_private\.h$',       # lib_private.h
-        r'_internal\.h$',      # lib_internal.h
-        r'pstream\.h$',        # often internal
-        r'detail[/\\]',        # C++ detail headers
-        r'impl[/\\]',          # C++ impl headers
+        r'(?i)priv\.h$',           # pngpriv.h, zlibpriv.h
+        r'(?i)private\.h$',        # private.h
+        r'(?i)internal\.h$',       # internal.h
+        r'(?i)internals\.h$',      # parserInternals.h, xmlInternals.h
+        r'(?i)_priv\.h$',          # lib_priv.h
+        r'(?i)_private\.h$',       # lib_private.h
+        r'(?i)_internal\.h$',      # lib_internal.h
+        r'(?i)pstream\.h$',        # often internal
+        r'(?i)detail[/\\]',        # C++ detail headers
+        r'(?i)impl[/\\]',          # C++ impl headers
     ]
     index = cindex.Index.create()
     signatures = {}
@@ -589,84 +591,6 @@ def extract_exported_functions(include_dirs: Set[str]) -> dict:
                                 signatures[func_name] = []
     
     return signatures
-
-def is_internal_function_name(func_name: str) -> bool:
-    """
-    Determine if a function name looks like an internal function.
-    
-    Internal patterns (NOT public APIs):
-    - Starts with underscore: _internal_func
-    - Starts with lowercase verb followed by underscore: handle_eXIf, process_data
-    - Contains 'internal' or 'private': internal_func, private_func
-    - Starts with uppercase followed by lowercase (CamelCase) without underscore separator: XmlParse, JsonDecode
-      (Public APIs typically use: XML_parse, JSON_decode or xml_parse, json_decode)
-    
-    Public API patterns:
-    - ALL_CAPS prefix with underscore: XML_Parse, PNG_read_info, JSON_parse
-    - lowercase prefix with underscore: png_read_info, expat_parse
-    - Single word verbs: parse, decode, encode
-    """
-    if not func_name or len(func_name) < 3:
-        return False
-    
-    import re
-    
-    # Pattern 1: Starts with underscore or double underscore
-    if func_name.startswith('_'):
-        return True
-    
-    # Pattern 2: Contains 'internal' or 'private'
-    if 'internal' in func_name.lower() or 'private' in func_name.lower():
-        return True
-    
-    # Pattern 3: Check for internal verb patterns after library prefix
-    # These are STRONG indicators of internal functions even with library prefix:
-    # - handle_* : chunk handlers, event handlers (e.g., png_handle_eXIf, xml_handle_entity)
-    # - do_* : internal action functions (e.g., png_do_read_transformations)
-    # - process_* : internal processing (e.g., png_process_IDAT_data)
-    # - internal_* : explicitly marked internal
-    # - private_* : explicitly marked private
-    #
-    # NOTE: We do NOT include read_, write_, parse_, check_, etc. here because
-    # these are common in public APIs: png_read_info, png_write_row, xml_parse, etc.
-    strong_internal_verbs = ['handle_', 'do_', 'process_', 'internal_', 'private_']
-    
-    # Extract the part after the first underscore (if any)
-    if '_' in func_name:
-        parts = func_name.split('_', 1)
-        if len(parts) > 1:
-            after_prefix = parts[1]
-            # Check if the part after prefix starts with a STRONG internal verb
-            for verb in strong_internal_verbs:
-                if after_prefix.startswith(verb):
-                    return True
-    
-    # Pattern 3b: Distinguish namespace-like prefixes from action verbs.
-    # A name like handle_chunk is usually internal, while foo_parse is often public.
-    lowercase_verb_pattern = r'^[a-z]+_[a-z]'
-    if re.match(lowercase_verb_pattern, func_name):
-        action_like_prefixes = {
-            'handle', 'process', 'parse', 'read', 'write', 'check', 'decode',
-            'encode', 'update', 'open', 'close', 'init', 'create', 'destroy',
-            'free', 'set', 'get', 'load', 'save', 'convert'
-        }
-        prefix = func_name.split('_')[0].lower()
-        if prefix in action_like_prefixes:
-            return True
-    
-    # Pattern 4: CamelCase without underscore (usually internal)
-    # e.g., XmlParse, JsonDecode, PngHandle
-    # Public APIs typically use underscores: XML_Parse, JSON_decode, png_read_info
-    if re.match(r'^[A-Z][a-z]+[A-Z]', func_name):
-        # CamelCase starting with capital - likely internal class method or internal function
-        return True
-    
-    # Pattern 5: Functions starting with uppercase followed by lowercase verb
-    # e.g., Handle_chunk, Process_data (usually internal callbacks)
-    if re.match(r'^[A-Z][a-z]+_[a-z]', func_name):
-        return True
-    
-    return False
 
 
 def _looks_like_c_type(text):

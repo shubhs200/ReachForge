@@ -189,7 +189,7 @@ def run_fuzzer(
     
     env = os.environ.copy()
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
-    env["UBSAN_OPTIONS"] = "abort_on_error=1"
+    env["UBSAN_OPTIONS"] = "abort_on_error=1:print_stacktrace=1:silence_unsigned_overflow=1"
     
     start_time = time.time()
     
